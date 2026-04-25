@@ -250,8 +250,9 @@ def main(unused_argv):
         algos = [
             RobustOfflineBatchNeuraLCB(hparams)
         ]
-        algo_prefix = 'robust_{}_risk={}_tau={}_beta={}'.format(
-            FLAGS.data_type, FLAGS.risk_measure, FLAGS.tau_n, FLAGS.beta
+        layer_str = "-".join([str(s) for s in layer_sizes])
+        algo_prefix = 'robust_{}_risk={}_tau={}_beta={}_n={}_layers={}'.format(
+            FLAGS.data_type, FLAGS.risk_measure, FLAGS.tau_n, FLAGS.beta, FLAGS.num_contexts, layer_str
         )
 
     #==============================
@@ -306,17 +307,24 @@ def main(unused_argv):
             acc = np.mean(test_actions.ravel() == opt_actions.ravel())
             
             # 4. Global Evaluation
-            eval_results = algo.evaluate_offline_policy(contexts, actions)
-            
-            print(f'Regret: {regret:.4f} | Acc: {acc:.4f} | Risk: {eval_results["marginal_risk"]:.4f}')
+            # 4.1 Risk of Behavior Policy (Offline Data)
+            behavior_eval = algo.evaluate_offline_policy(contexts, actions)
+
+            # 4.2 Risk of Learned Policy (Target)
+            learned_train_actions = algo.sample_action(contexts)
+            learned_eval = algo.evaluate_offline_policy(contexts, learned_train_actions)
+
+            print(f'Regret: {regret:.4f} | Acc: {acc:.4f}')
+            print(f'Risk (Offline Data): {behavior_eval["marginal_risk"]:.4f}')
+            print(f'Risk (Learned Policy): {learned_eval["marginal_risk"]:.4f}')
             
             if FLAGS.use_wandb:
                 wandb.log({
                     "sim": sim,
                     "test_regret": regret,
                     "test_accuracy": acc,
-                    "marginal_risk": eval_results["marginal_risk"],
-                    "mean_uncertainty_R": eval_results["mean_uncertainty_R"] if "mean_uncertainty_R" in eval_results else eval_results.get("mean_R_pi", 0)
+                    "offline_data_risk": behavior_eval["marginal_risk"],
+                    "learned_policy_risk": learned_eval["marginal_risk"]
                 })
             
             all_regrets.append(regret)
