@@ -115,7 +115,10 @@ def main(unused_argv):
             eps=FLAGS.eps
         )
     elif FLAGS.data_type == 'simglucose':
-        data = SimglucoseData(path='data/simglucose_offline.npz')
+        data = SimglucoseData(
+            path='data/simglucose_offline.npz',
+            num_contexts=FLAGS.num_contexts
+        )
     else:
         raise NotImplementedError
 
@@ -170,14 +173,12 @@ def main(unused_argv):
     )
 
     data_prefix = '{}_d={}_a={}_pi={}_std={}'.format(FLAGS.data_type, \
-            context_dim, num_actions, policy_prefix, data.noise_std)
+            context_dim, num_actions, policy_prefix, data.noise_std if hasattr(data, 'noise_std') else 'N/A')
 
     res_dir = os.path.join('results', data_prefix) 
 
     if not os.path.exists(res_dir):
         os.makedirs(res_dir)
-
-       
 
     #================================================================
     # Algorithms 
@@ -186,65 +187,12 @@ def main(unused_argv):
     if FLAGS.algo_group == 'approx-neural':
         algos = [
                 UniformSampling(lin_hparams),
-                # NeuralGreedyV2(hparams, update_freq = FLAGS.update_freq), 
                 ApproxNeuraLCBV2(hparams, update_freq = FLAGS.update_freq)
             ]
 
         algo_prefix = 'approx-neural-gridsearch_epochs={}_m={}_layern={}_buffer={}_bs={}_lr={}_beta={}_lambda={}_lambda0={}'.format(
             hparams.num_steps, min(hparams.layer_sizes), hparams.layer_n, hparams.buffer_s, hparams.batch_size, hparams.lr, \
             hparams.beta, hparams.lambd, hparams.lambd0
-        )
-
-    
-    if FLAGS.algo_group == 'neural-greedy':
-        algos = [
-                UniformSampling(lin_hparams),
-                NeuralGreedyV2(hparams, update_freq = FLAGS.update_freq), 
-            ]
-
-        algo_prefix = 'neural-greedy-gridsearch_epochs={}_m={}_layern={}_buffer={}_bs={}_lr={}_lambda={}'.format(
-            hparams.num_steps, min(hparams.layer_sizes), hparams.layer_n, hparams.buffer_s, hparams.batch_size, hparams.lr, \
-           hparams.lambd
-        ) 
-
-
-
-    if FLAGS.algo_group == 'baseline':
-        algos = [
-            UniformSampling(lin_hparams),
-            LinLCB(lin_hparams),
-            ## KernLCB(lin_hparams), 
-            # NeuralGreedyV2(hparams, update_freq = FLAGS.update_freq),
-            # ApproxNeuralLinLCBV2(hparams), 
-            # ApproxNeuralLinGreedyV2(hparams),
-            NeuralLinGreedyJointModel(hparams), 
-            ApproxNeuralLinLCBJointModel(hparams)
-
-        ]
-
-        algo_prefix = 'baseline_epochs={}_m={}_layern={}_beta={}_lambda0={}_rbf-sigma={}_maxnum={}'.format(
-            hparams.num_steps, min(hparams.layer_sizes), hparams.layer_n, \
-            hparams.beta, hparams.lambd0, lin_hparams.rbf_sigma, lin_hparams.max_num_sample
-        )
-
-    if FLAGS.algo_group == 'kern': # for tuning KernLCB
-        algos = [
-            UniformSampling(lin_hparams),
-            KernLCB(lin_hparams), 
-        ]
-
-        algo_prefix = 'kern-gridsearch_beta={}_rbf-sigma={}_maxnum={}'.format(
-            hparams.beta, lin_hparams.rbf_sigma, lin_hparams.max_num_sample
-        )
-
-    if FLAGS.algo_group == 'neurallinlcb': # Tune NeuralLinLCB seperately  
-        algos = [
-            UniformSampling(lin_hparams),
-            ApproxNeuralLinLCBJointModel(hparams)
-        ]
-
-        algo_prefix = 'neurallinlcb-gridsearch_m={}_layern={}_beta={}_lambda0={}'.format(
-            min(hparams.layer_sizes), hparams.layer_n, hparams.beta, hparams.lambd0
         )
 
     if FLAGS.algo_group == 'robust-offline':
@@ -273,11 +221,11 @@ def main(unused_argv):
     file_name = os.path.join(res_dir, algo_prefix) + '.npz' 
 
     if FLAGS.algo_group == 'robust-offline':
-        # Special runner for pure batch offline algorithms
         all_regrets = []
         all_accs = []
         all_times = []
         all_gt_cvars = []
+        all_oracle_cvars = []
         
         for sim in range(FLAGS.num_sim):
             t0 = time.time()
@@ -285,9 +233,10 @@ def main(unused_argv):
             
             # 1. Reset data and algo
             contexts, actions, rewards, test_ctx, test_mean = data.reset_data(sim)
-            # behavior rewards only for selected actions
-            n = contexts.shape[0]
-            beh_rewards = rewards[np.arange(n), actions.ravel()]
+            
+            # behavior rewards only for selected actions (for training)
+            # For data already split (simglucose), rewards is the target vector
+            beh_rewards = rewards 
             
             algo = algos[0]
             algo.reset(sim * 1111)
@@ -306,44 +255,54 @@ def main(unused_argv):
             regret = np.mean(opt_vals - sel_vals)
             acc = np.mean(test_actions.ravel() == opt_actions.ravel())
             
-            # 3.2 Calculate Ground Truth Risk (Oracle Evaluation using Simulator)
-            # Only possible for 'robust_syn' where ground truth is known.
+            # 3.2 Calculate Ground Truth Risks (Oracle Evaluation)
             if FLAGS.data_type == 'robust_syn':
-                # Use the same actions selected above
-                true_means = sel_vals 
-                # Generate stochastic noise
-                fresh_noise = data.generate_noise(true_means.shape)
-                # Compute final stochastic rewards
-                true_noisy_rewards = true_means + fresh_noise
-                # Compute Ground Truth CVaR
-                sorted_r = np.sort(true_noisy_rewards)
-                gt_cvar = np.mean(sorted_r[:int(FLAGS.alpha * len(sorted_r))])
-                gt_str = f" | GT CVaR: {gt_cvar:.4f}"
+                # Agent 
+                fresh_noise = data.generate_noise(sel_vals.shape)
+                agent_noisy_r = sel_vals + fresh_noise
+                # Oracle
+                oracle_noise = data.generate_noise(opt_vals.shape)
+                oracle_noisy_r = opt_vals + oracle_noise
+            elif FLAGS.data_type == 'simglucose':
+                # Simglucose already contains realized rewards in its matrix
+                agent_noisy_r = sel_vals
+                oracle_noisy_r = opt_vals
             else:
-                gt_cvar = 0.0
+                agent_noisy_r, oracle_noisy_r = None, None
+
+            if agent_noisy_r is not None:
+                # Compute CVaR
+                sorted_agent = np.sort(agent_noisy_r)
+                gt_cvar = np.mean(sorted_agent[:int(FLAGS.alpha * len(sorted_agent))])
+                sorted_oracle = np.sort(oracle_noisy_r)
+                oracle_cvar = np.mean(sorted_oracle[:int(FLAGS.alpha * len(sorted_oracle))])
+                gt_str = f" | GT CVaR: {gt_cvar:.4f} | Oracle CVaR: {oracle_cvar:.4f}"
+            else:
+                gt_cvar, oracle_cvar = 0.0, 0.0
                 gt_str = ""
 
             print(f'Regret: {regret:.4f} | Acc: {acc:.4f}{gt_str}')
             
             if FLAGS.use_wandb:
                 log_data = {
-                    "sim": sim,
-                    "test_regret": regret,
-                    "test_accuracy": acc,
+                    "sim": sim, "test_regret": regret, "test_accuracy": acc,
+                    "gt_cvar": gt_cvar, "oracle_cvar": oracle_cvar
                 }
-                if FLAGS.data_type == 'robust_syn':
-                    log_data["gt_cvar"] = gt_cvar
                 wandb.log(log_data)
             
             all_regrets.append(regret)
             all_accs.append(acc)
             all_times.append(time.time() - t0)
             all_gt_cvars.append(gt_cvar)
+            all_oracle_cvars.append(oracle_cvar)
             
         regrets = np.array(all_regrets, dtype=np.float32).reshape(FLAGS.num_sim, 1, 1)
         errs = (1.0 - np.array(all_accs, dtype=np.float32)).reshape(FLAGS.num_sim, 1, 1)
         gt_cvars = np.array(all_gt_cvars, dtype=np.float32).reshape(FLAGS.num_sim, 1, 1)
-        np.savez(file_name, regrets=regrets, errs=errs, gt_cvars=gt_cvars, times=np.array(all_times))
+        oracle_cvars = np.array(all_oracle_cvars, dtype=np.float32).reshape(FLAGS.num_sim, 1, 1)
+        
+        np.savez(file_name, regrets=regrets, errs=errs, gt_cvars=gt_cvars, 
+                 oracle_cvars=oracle_cvars, times=np.array(all_times))
     else:
         regrets, errs = contextual_bandit_runner(algos, data, FLAGS.num_sim, 
             FLAGS.update_freq, FLAGS.test_freq, FLAGS.verbose, FLAGS.debug, FLAGS.normalize, file_name)

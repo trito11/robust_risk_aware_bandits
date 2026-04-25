@@ -5,7 +5,7 @@ This repository contains the JAX implementation for **Robust Risk-Aware Offline 
 ## Key Features
 * **Risk-Aware Learning**: Optimize Conditional Value at Risk (CVaR), Entropic Risk, and Mean-Variance measures.
 * **Robustness (Tofu Loss)**: Reward truncation to mitigate the impact of black-swan outliers and heavy-tailed noise.
-* **Medical Simulation Support**: Integration with `simglucose` for Type-1 Diabetes bolus estimation research.
+* **Medical Simulation Support**: Integration with `simglucose` for Type-1 Diabetes bolus estimation research featuring multi-patient modeling and a 4-hour post-prandial risk assessment.
 * **Efficient Covariance Matrix**: Memory-optimized chunked calculation for the exact neural tangent kernel (NTK) covariance.
 
 ## Dependencies 
@@ -19,58 +19,61 @@ pip install -r requirements.txt
 ## Data Generation
 Before running medical simulations, generate the offline dataset:
 ```bash
-# 1. Generate Simglucose data (UVA/Padova model)
+# Generate Simglucose data (UVA/Padova model)
+# This simulates 4 patients with 5% sensor failure-induced outliers
 PYTHONPATH=. python data/simglucose_offline_gen.py
-
-# 2. (Optional) Generate Robust Synthetic data
-# Automatically generated when running synthetic_main.py or realworld_main.py with --data_type robust_syn
 ```
 
 ## Running the Experiments
 
-### 1. Robust Risk-Aware OPL (Medical Data)
-Run the `RobustOfflineBatchNeuraLCB` algorithm on the generated Simglucose dataset:
+### 1. Manual Execution
+Run the `RobustOfflineBatchNeuraLCB` algorithm:
 ```bash
-XLA_PYTHON_CLIENT_PREALLOCATE=false \
+# Medical Data (Simglucose)
+# Requires --context_dim 4 and --num_actions 11
 PYTHONPATH=. python realworld_main.py \
-    --data_type simglucose \
-    --algo_group robust-offline \
-    --risk_measure cvar \
-    --alpha 0.05 \
-    --tau_n 1.0 \
-    --beta 0.1 \
-    --num_sim 1 \
-    --num_steps 1000 \
-    --layer_sizes 16,16 \
-    --nouse_wandb
+    --data_type simglucose --context_dim 4 --num_actions 11 \
+    --algo_group robust-offline --risk_measure cvar --beta 0.1
+
+# Synthetic Data
+PYTHONPATH=. python realworld_main.py \
+    --data_type robust_syn --function_type cosine --noise_type student-t \
+    --algo_group robust-offline --num_sim 100
 ```
 
-### 2. Robust Synthetic Experiments
+### 2. Automated Sweeps (Benchmarking)
+To generate results for multiple sample sizes ($N$) and compute confidence intervals (as shown in standard papers):
+
 ```bash
-PYTHONPATH=. python realworld_main.py \
-    --data_type robust_syn \
-    --function_type cosine \
-    --noise_type student-t \
-    --algo_group robust-offline \
-    --num_steps 500
+# Run sweep for Synthetic data (Varying N from 1k to 20k)
+python run_robust_sweep.py
+
+# Run sweep for Medical data (Varying N for Simglucose)
+python run_simglucose_sweep.py
 ```
+
+## Evaluation Metrics
+The results are saved in `results/` as `.npz` files containing:
+* **Regret**: Difference between optimal reward (Oracle) and agent's reward.
+* **GT CVaR**: The actual ground-truth risk encountered in the simulator (bottom 5% of rewards).
+* **Oracle CVaR**: The theoretical best risk achievable by the optimal policy.
+* **Err**: Error rate (1 - Accuracy) in selecting the optimal arm.
 
 ## Available Parameters
 
 | Flag | Description | Default |
 |------|-------------|---------|
-| `--data_type` | Dataset (`simglucose`, `robust_syn`, `mushroom`, `mnist`, etc.) | `mushroom` |
+| `--data_type` | Dataset (`simglucose`, `robust_syn`, `mushroom`, etc.) | `mushroom` |
 | `--algo_group` | Algorithm group (`robust-offline`, `approx-neural`, `baseline`) | `approx-neural` |
 | `--risk_measure` | Risk functional (`cvar`, `mean`, `entropic`, `mean_variance`) | `cvar` |
 | `--alpha` | CVaR level (tail probability) | `0.05` |
 | `--tau_n` | Truncation threshold for Tofu Loss | `1.0` |
 | `--beta` | Confidence parameter (pessimism level) | `0.1` |
-| `--layer_sizes` | Neural network structure (e.g., `16,16` or `64,64`) | `100,100` |
-| `--num_steps` | Number of gradient updates for training | `100` |
-| `--num_sim` | Number of independent simulations to run | `10` |
+| `--layer_sizes` | Neural network structure (use comma for multiple layers, e.g., `32,32`) | `100,100` |
+| `--num_sim` | Number of independent simulations per N (for error bars) | `10` |
 
 ## Repository Structure
-* `/algorithms`: Implementation of `RobustOfflineBatchNeuraLCB` and baseline bandit models.
+* `/algorithms`: Implementation of `RobustOfflineBatchNeuraLCB` and baseline models.
 * `/core`: Core JAX neural network utilities and bandit runners.
-* `/data`: Data loaders and synthetic generators (`simglucose`, `robust_synthetic_data`).
-* `realworld_main.py`: Entry point for experiments.
+* `/data`: Data loaders and generators (`simglucose`, `robust_synthetic_data`).
+* `run_..._sweep.py`: Automation scripts for large-scale experiments.
