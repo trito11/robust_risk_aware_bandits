@@ -239,7 +239,13 @@ def main(unused_argv):
             contexts, actions, rewards, test_ctx, test_mean = data.reset_data(sim)
             
             # behavior rewards only for selected actions (for training)
-            beh_rewards = rewards 
+            if len(rewards.shape) > 1:
+                # For synthetic data where 'rewards' is (N, K)
+                n = contexts.shape[0]
+                beh_rewards = rewards[np.arange(n), actions.ravel()]
+            else:
+                # For data already split (simglucose), 'rewards' is already (N,)
+                beh_rewards = rewards 
             
             algo = algos[0]
             algo.reset(sim * 1111)
