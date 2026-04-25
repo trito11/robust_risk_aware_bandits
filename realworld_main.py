@@ -226,6 +226,10 @@ def main(unused_argv):
         all_times = []
         all_gt_cvars = []
         all_oracle_cvars = []
+        all_gt_means = []
+        all_gt_vars = []
+        all_oracle_means = []
+        all_oracle_vars = []
         
         for sim in range(FLAGS.num_sim):
             t0 = time.time()
@@ -235,7 +239,6 @@ def main(unused_argv):
             contexts, actions, rewards, test_ctx, test_mean = data.reset_data(sim)
             
             # behavior rewards only for selected actions (for training)
-            # For data already split (simglucose), rewards is the target vector
             beh_rewards = rewards 
             
             algo = algos[0]
@@ -271,22 +274,31 @@ def main(unused_argv):
                 agent_noisy_r, oracle_noisy_r = None, None
 
             if agent_noisy_r is not None:
-                # Compute CVaR
+                # Calculate Agent stats
+                gt_mean = np.mean(agent_noisy_r)
+                gt_var = np.var(agent_noisy_r)
                 sorted_agent = np.sort(agent_noisy_r)
                 gt_cvar = np.mean(sorted_agent[:int(FLAGS.alpha * len(sorted_agent))])
+
+                # Calculate Oracle stats
+                oracle_mean = np.mean(oracle_noisy_r)
+                oracle_var = np.var(oracle_noisy_r)
                 sorted_oracle = np.sort(oracle_noisy_r)
                 oracle_cvar = np.mean(sorted_oracle[:int(FLAGS.alpha * len(sorted_oracle))])
-                gt_str = f" | GT CVaR: {gt_cvar:.4f} | Oracle CVaR: {oracle_cvar:.4f}"
-            else:
-                gt_cvar, oracle_cvar = 0.0, 0.0
-                gt_str = ""
 
-            print(f'Regret: {regret:.4f} | Acc: {acc:.4f}{gt_str}')
+                stat_str = f" | GT Mean/Var/CVaR: {gt_mean:.2f}/{gt_var:.2f}/{gt_cvar:.2f}"
+                ora_str = f" | Oracle Mean/Var/CVaR: {oracle_mean:.2f}/{oracle_var:.2f}/{oracle_cvar:.2f}"
+                print(f'Regret: {regret:.4f} | Acc: {acc:.4f}{stat_str}{ora_str}')
+            else:
+                gt_mean = gt_var = gt_cvar = 0.0
+                oracle_mean = oracle_var = oracle_cvar = 0.0
+                print(f'Regret: {regret:.4f} | Acc: {acc:.4f}')
             
             if FLAGS.use_wandb:
                 log_data = {
                     "sim": sim, "test_regret": regret, "test_accuracy": acc,
-                    "gt_cvar": gt_cvar, "oracle_cvar": oracle_cvar
+                    "gt_mean": gt_mean, "gt_var": gt_var, "gt_cvar": gt_cvar,
+                    "oracle_mean": oracle_mean, "oracle_var": oracle_var, "oracle_cvar": oracle_cvar
                 }
                 wandb.log(log_data)
             
@@ -295,14 +307,26 @@ def main(unused_argv):
             all_times.append(time.time() - t0)
             all_gt_cvars.append(gt_cvar)
             all_oracle_cvars.append(oracle_cvar)
+            all_gt_means.append(gt_mean)
+            all_gt_vars.append(gt_var)
+            all_oracle_means.append(oracle_mean)
+            all_oracle_vars.append(oracle_var)
             
         regrets = np.array(all_regrets, dtype=np.float32).reshape(FLAGS.num_sim, 1, 1)
         errs = (1.0 - np.array(all_accs, dtype=np.float32)).reshape(FLAGS.num_sim, 1, 1)
-        gt_cvars = np.array(all_gt_cvars, dtype=np.float32).reshape(FLAGS.num_sim, 1, 1)
-        oracle_cvars = np.array(all_oracle_cvars, dtype=np.float32).reshape(FLAGS.num_sim, 1, 1)
         
-        np.savez(file_name, regrets=regrets, errs=errs, gt_cvars=gt_cvars, 
-                 oracle_cvars=oracle_cvars, times=np.array(all_times))
+        save_dict = {
+            "regrets": regrets,
+            "errs": errs,
+            "times": np.array(all_times),
+            "gt_cvars": np.array(all_gt_cvars),
+            "oracle_cvars": np.array(all_oracle_cvars),
+            "gt_means": np.array(all_gt_means),
+            "gt_vars": np.array(all_gt_vars),
+            "oracle_means": np.array(all_oracle_means),
+            "oracle_vars": np.array(all_oracle_vars)
+        }
+        np.savez(file_name, **save_dict)
     else:
         regrets, errs = contextual_bandit_runner(algos, data, FLAGS.num_sim, 
             FLAGS.update_freq, FLAGS.test_freq, FLAGS.verbose, FLAGS.debug, FLAGS.normalize, file_name)
