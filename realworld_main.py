@@ -5,6 +5,7 @@ import jax
 import jax.numpy as jnp 
 from easydict import EasyDict as edict
 import os 
+import time 
 
 from core.contextual_bandit import contextual_bandit_runner
 from algorithms.neural_offline_bandit import ExactNeuraLCBV2, NeuralGreedyV2, ApproxNeuraLCBV2, RobustOfflineBatchNeuraLCB
@@ -275,13 +276,16 @@ def main(unused_argv):
         # Special runner for pure batch offline algorithms
         all_regrets = []
         all_accs = []
+        all_times = []
+        all_gt_cvars = []
         
         for sim in range(FLAGS.num_sim):
+            t0 = time.time()
             print(f'Simulation: {sim + 1}/{FLAGS.num_sim}')
+            
             # 1. Reset data and algo
             contexts, actions, rewards, test_ctx, test_mean = data.reset_data(sim)
-            # rewards is (N, num_actions) but behavior only selected actions[i]
-            # Convert to (N,) raw rewards for train_offline_batch
+            # behavior rewards only for selected actions
             n = contexts.shape[0]
             beh_rewards = rewards[np.arange(n), actions.ravel()]
             
@@ -291,41 +295,27 @@ def main(unused_argv):
             # 2. Train Batch
             algo.train_offline_batch(contexts, actions, beh_rewards)
 
-            # 2.5 Save Model
-            if hasattr(algo, 'save_model'):
-                save_path = FLAGS.save_model_path.replace('.pkl', f'_sim{sim}.pkl')
-                os.makedirs(os.path.dirname(save_path), exist_ok=True)
-                algo.save_model(save_path)
-            
-            # 3. Test
+            # 3. Policy Evaluation (Run action selection once)
             test_actions = algo.sample_action(test_ctx)
-            sel_vals = test_mean[np.arange(data.num_test_contexts), test_actions.ravel()]
-            opt_vals = np.max(test_mean, axis=1)
             opt_actions = np.argmax(test_mean, axis=1)
+            
+            # 3.1 Calculate True Regret and Accuracy
+            opt_vals = test_mean[np.arange(test_mean.shape[0]), opt_actions.ravel()]
+            sel_vals = test_mean[np.arange(test_mean.shape[0]), test_actions.ravel()]
             
             regret = np.mean(opt_vals - sel_vals)
             acc = np.mean(test_actions.ravel() == opt_actions.ravel())
             
-            # 4. Global Policy Evaluation
-            
-            # 4.1 Model-based Risk Estimate (using Neural Network predictions)
-            # Evaluation of the Learned Policy (Target)
-            learned_train_actions = algo.sample_action(contexts)
-            learned_eval = algo.evaluate_offline_policy(contexts, learned_train_actions)
-
-            # 4.2 Ground Truth Risk (Oracle Evaluation using Simulator)
-            # This calculates the actual risk the agent would face in the environment.
+            # 3.2 Calculate Ground Truth Risk (Oracle Evaluation using Simulator)
             # Only possible for 'robust_syn' where ground truth is known.
             if FLAGS.data_type == 'robust_syn':
-                # Fetch actions proposal from Agent
-                test_actions_eval = algo.sample_action(test_ctx)
-                # Get True Expected Rewards (no noise)
-                true_means = test_mean[np.arange(test_mean.shape[0]), test_actions_eval.ravel()]
-                # Generate a single realization of stochastic noise
+                # Use the same actions selected above
+                true_means = sel_vals 
+                # Generate stochastic noise
                 fresh_noise = data.generate_noise(true_means.shape)
-                # Calculate the final stochastic reward for each sample
+                # Compute final stochastic rewards
                 true_noisy_rewards = true_means + fresh_noise
-                # Compute Ground Truth CVaR (alpha=0.05)
+                # Compute Ground Truth CVaR
                 sorted_r = np.sort(true_noisy_rewards)
                 gt_cvar = np.mean(sorted_r[:int(FLAGS.alpha * len(sorted_r))])
                 gt_str = f" | GT CVaR: {gt_cvar:.4f}"
@@ -334,14 +324,12 @@ def main(unused_argv):
                 gt_str = ""
 
             print(f'Regret: {regret:.4f} | Acc: {acc:.4f}{gt_str}')
-            print(f'Model Risk (Policy): {learned_eval["marginal_risk"]:.4f}')
             
             if FLAGS.use_wandb:
                 log_data = {
                     "sim": sim,
                     "test_regret": regret,
                     "test_accuracy": acc,
-                    "model_policy_risk": learned_eval["marginal_risk"]
                 }
                 if FLAGS.data_type == 'robust_syn':
                     log_data["gt_cvar"] = gt_cvar
@@ -349,14 +337,17 @@ def main(unused_argv):
             
             all_regrets.append(regret)
             all_accs.append(acc)
+            all_times.append(time.time() - t0)
+            all_gt_cvars.append(gt_cvar)
             
         regrets = np.array(all_regrets, dtype=np.float32).reshape(FLAGS.num_sim, 1, 1)
         errs = (1.0 - np.array(all_accs, dtype=np.float32)).reshape(FLAGS.num_sim, 1, 1)
+        gt_cvars = np.array(all_gt_cvars, dtype=np.float32).reshape(FLAGS.num_sim, 1, 1)
+        np.savez(file_name, regrets=regrets, errs=errs, gt_cvars=gt_cvars, times=np.array(all_times))
     else:
         regrets, errs = contextual_bandit_runner(algos, data, FLAGS.num_sim, 
             FLAGS.update_freq, FLAGS.test_freq, FLAGS.verbose, FLAGS.debug, FLAGS.normalize, file_name)
-
-    np.savez(file_name, regrets, errs)
+        np.savez(file_name, regrets=regrets, errs=errs)
 
     if FLAGS.use_wandb:
         wandb.finish()
