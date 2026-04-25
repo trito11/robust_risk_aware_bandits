@@ -1,0 +1,338 @@
+"""Mini main for testing algorithms. """ 
+
+import numpy as np 
+import jax  
+import jax.numpy as jnp 
+from easydict import EasyDict as edict
+import os 
+
+from core.contextual_bandit import contextual_bandit_runner
+from algorithms.neural_offline_bandit import ExactNeuraLCBV2, NeuralGreedyV2, ApproxNeuraLCBV2, RobustOfflineBatchNeuraLCB
+from algorithms.lin_lcb import LinLCB 
+from algorithms.kern_lcb import KernLCB 
+from algorithms.uniform_sampling import UniformSampling
+from algorithms.neural_lin_lcb import ExactNeuralLinLCBV2, ExactNeuralLinGreedyV2, ApproxNeuralLinLCBV2, ApproxNeuralLinGreedyV2, \
+    ApproxNeuralLinLCBJointModel, NeuralLinGreedyJointModel
+import wandb
+from data.realworld_data import *
+from data.robust_synthetic_data import RobustSyntheticData
+from data.npz_data import SimglucoseData
+
+from absl import flags, app
+
+
+FLAGS = flags.FLAGS 
+
+flags.DEFINE_string('data_type', 'mushroom', 'Dataset to sample from')
+flags.DEFINE_string('policy', 'eps-greedy', 'Offline policy, eps-greedy/subset')
+flags.DEFINE_float('eps', 0.1, 'Probability of selecting a random action in eps-greedy')
+flags.DEFINE_float('subset_r', 0.5, 'The ratio of the action spaces to be selected in offline data')
+flags.DEFINE_integer('num_contexts', 15000, 'Number of contexts for training.') 
+flags.DEFINE_integer('num_test_contexts', 10000, 'Number of contexts for test.') 
+flags.DEFINE_boolean('verbose', True, 'verbose') 
+flags.DEFINE_boolean('debug', True, 'debug') 
+flags.DEFINE_boolean('normalize', False, 'normalize the regret') 
+flags.DEFINE_integer('update_freq', 1, 'Update frequency')
+flags.DEFINE_integer('freq_summary', 10, 'Summary frequency')
+
+flags.DEFINE_integer('test_freq', 10, 'Test frequency')
+flags.DEFINE_string('algo_group', 'approx-neural', 'baseline/neural')
+flags.DEFINE_integer('num_sim', 10, 'Number of simulations')
+flags.DEFINE_float('noise_std', 0.1, 'Noise std')
+flags.DEFINE_integer('context_dim', 20, 'Context dimension for synthetic data')
+flags.DEFINE_integer('num_actions', 30, 'Number of actions for synthetic data')
+flags.DEFINE_list('layer_sizes', ['100', '100'], 'Layer sizes for Neural Network')
+
+flags.DEFINE_integer('chunk_size', 500, 'Chunk size')
+flags.DEFINE_integer('batch_size', 32, 'Batch size')
+flags.DEFINE_integer('num_steps', 100, 'Number of steps to train NN.') 
+flags.DEFINE_integer('buffer_s', -1, 'Size in the train data buffer.')
+flags.DEFINE_bool('data_rand', True, 'Where randomly sample a data batch or  use the latest samples in the buffer' )
+
+flags.DEFINE_float('rbf_sigma', 1, 'RBF sigma for KernLCB') # [0.1, 1, 10]
+
+# NeuraLCB 
+flags.DEFINE_float('beta', 0.1, 'confidence paramter') # [0.01, 0.05, 0.1, 0.5, 1, 5, 10] 
+flags.DEFINE_float('lr', 1e-3, 'learning rate') 
+flags.DEFINE_float('lambd0', 0.1, 'minimum eigenvalue') 
+flags.DEFINE_float('lambd', 1e-4, 'regularization parameter')
+
+# RobustOfflineBatchNeuraLCB params
+flags.DEFINE_string('risk_measure', 'cvar', 'Risk measure: mean/cvar/entropic/mean_variance')
+flags.DEFINE_float('tau_n', 1.0, 'Truncation threshold for Tofu loss')
+flags.DEFINE_float('alpha', 0.05, 'CVaR alpha level')
+flags.DEFINE_float('entropic_theta', 1.0, 'Theta for entropic risk')
+flags.DEFINE_float('variance_lambda', 0.1, 'Lambda for mean-variance')
+flags.DEFINE_string('truncation_mode', 'clip', 'clip or mask')
+flags.DEFINE_string('noise_type', 'student-t', 'student-t, gaussian, binary-heavy')
+flags.DEFINE_string('function_type', 'quadratic', 'linear, quadratic, quadratic2, cosine')
+flags.DEFINE_string('save_model_path', 'results/model.pkl', 'Path to save weights after training')
+
+# Logging
+flags.DEFINE_boolean('use_wandb', False, 'Whether to use wandb for logging')
+flags.DEFINE_string('wandb_project', 'offline_neural_bandits', 'wandb project name')
+flags.DEFINE_string('wandb_entity', None, 'wandb entity')
+
+#================================================================
+# Network parameters
+#================================================================
+def main(unused_argv): 
+    print("Starting experiment script...")
+
+    #=================
+    # Data 
+    #=================
+    if FLAGS.policy == 'eps-greedy':
+        policy_prefix = '{}{}'.format(FLAGS.policy, FLAGS.eps)
+    elif FLAGS.policy == 'subset':
+        policy_prefix = '{}{}'.format(FLAGS.policy, FLAGS.subset_r)
+    elif FLAGS.policy == 'online':
+        policy_prefix = '{}{}'.format(FLAGS.policy, FLAGS.eps) 
+    else:
+        raise NotImplementedError('{} not implemented'.format(FLAGS.policy))
+
+    dataclasses = {'mushroom':MushroomData, 'jester':JesterData, 'statlog':StatlogData, 'covertype':CoverTypeData, 'stock': StockData,
+            'adult': AdultData, 'census': CensusData, 'mnist': MnistData
+    }
+    
+    if FLAGS.data_type in dataclasses:
+        DataClass = dataclasses[FLAGS.data_type]
+        data = DataClass(num_contexts=FLAGS.num_contexts, 
+                    num_test_contexts=FLAGS.num_test_contexts,
+                    pi = FLAGS.policy, 
+                    eps = FLAGS.eps, 
+                    subset_r = FLAGS.subset_r) 
+    elif FLAGS.data_type == 'robust_syn':
+        data = RobustSyntheticData(
+            num_contexts=FLAGS.num_contexts,
+            num_test_contexts=FLAGS.num_test_contexts,
+            context_dim=FLAGS.context_dim,
+            num_actions=FLAGS.num_actions,
+            function_type=FLAGS.function_type,
+            noise_type=FLAGS.noise_type,
+            pi=FLAGS.policy,
+            eps=FLAGS.eps
+        )
+    elif FLAGS.data_type == 'simglucose':
+        data = SimglucoseData(path='data/simglucose_offline.npz')
+    else:
+        raise NotImplementedError
+
+    if FLAGS.data_type == 'mnist': # Use 1000 test points for mnist 
+        FLAGS.num_test_contexts = 1000  
+        FLAGS.test_freq = 100
+        FLAGS.chunk_size = 1
+    dataset = data.reset_data()
+    context_dim = dataset[0].shape[1] 
+    num_actions = data.num_actions 
+    
+    # Process layer_sizes flag: convert list of strings to list of ints
+    layer_sizes = [int(s) for s in FLAGS.layer_sizes]
+    
+    hparams = edict({
+        'layer_sizes': layer_sizes, 
+        's_init': 1, 
+        'activation': jax.nn.relu, 
+        'layer_n': True,
+        'seed': 0,
+        'context_dim': context_dim, 
+        'num_actions': num_actions, 
+        'beta': FLAGS.beta, # [0.01, 0.05, 0.1, 0.5, 1, 5, 10]
+        'lambd': FLAGS.lambd, # regularization param: [0.1m, m, 10 m  ]
+        'lr': FLAGS.lr, 
+        'lambd0': FLAGS.lambd0, # shoud be lambd/m in theory but we fix this at 0.1 for simplicity and mainly focus on tuning beta 
+        'verbose': FLAGS.verbose, 
+        'batch_size': FLAGS.batch_size,
+        'freq_summary': FLAGS.freq_summary, 
+        'chunk_size': FLAGS.chunk_size, 
+        'num_steps': FLAGS.num_steps, 
+        'buffer_s': FLAGS.buffer_s, 
+        'data_rand': FLAGS.data_rand,
+        'debug_mode': 'full', # simple/full
+        'risk_measure': FLAGS.risk_measure,
+        'tau_n': FLAGS.tau_n,
+        'alpha': FLAGS.alpha,
+        'entropic_theta': FLAGS.entropic_theta,
+        'variance_lambda': FLAGS.variance_lambda,
+        'truncation_mode': FLAGS.truncation_mode
+    })
+
+    lin_hparams = edict(
+        {
+            'context_dim': hparams.context_dim, 
+            'num_actions': hparams.num_actions, 
+            'lambd0': hparams.lambd0, 
+            'beta': hparams.beta, 
+            'rbf_sigma': FLAGS.rbf_sigma, # 0.1, 1, 10
+            'max_num_sample': 1000 
+        }
+    )
+
+    data_prefix = '{}_d={}_a={}_pi={}_std={}'.format(FLAGS.data_type, \
+            context_dim, num_actions, policy_prefix, data.noise_std)
+
+    res_dir = os.path.join('results', data_prefix) 
+
+    if not os.path.exists(res_dir):
+        os.makedirs(res_dir)
+
+       
+
+    #================================================================
+    # Algorithms 
+    #================================================================
+
+    if FLAGS.algo_group == 'approx-neural':
+        algos = [
+                UniformSampling(lin_hparams),
+                # NeuralGreedyV2(hparams, update_freq = FLAGS.update_freq), 
+                ApproxNeuraLCBV2(hparams, update_freq = FLAGS.update_freq)
+            ]
+
+        algo_prefix = 'approx-neural-gridsearch_epochs={}_m={}_layern={}_buffer={}_bs={}_lr={}_beta={}_lambda={}_lambda0={}'.format(
+            hparams.num_steps, min(hparams.layer_sizes), hparams.layer_n, hparams.buffer_s, hparams.batch_size, hparams.lr, \
+            hparams.beta, hparams.lambd, hparams.lambd0
+        )
+
+    
+    if FLAGS.algo_group == 'neural-greedy':
+        algos = [
+                UniformSampling(lin_hparams),
+                NeuralGreedyV2(hparams, update_freq = FLAGS.update_freq), 
+            ]
+
+        algo_prefix = 'neural-greedy-gridsearch_epochs={}_m={}_layern={}_buffer={}_bs={}_lr={}_lambda={}'.format(
+            hparams.num_steps, min(hparams.layer_sizes), hparams.layer_n, hparams.buffer_s, hparams.batch_size, hparams.lr, \
+           hparams.lambd
+        ) 
+
+
+
+    if FLAGS.algo_group == 'baseline':
+        algos = [
+            UniformSampling(lin_hparams),
+            LinLCB(lin_hparams),
+            ## KernLCB(lin_hparams), 
+            # NeuralGreedyV2(hparams, update_freq = FLAGS.update_freq),
+            # ApproxNeuralLinLCBV2(hparams), 
+            # ApproxNeuralLinGreedyV2(hparams),
+            NeuralLinGreedyJointModel(hparams), 
+            ApproxNeuralLinLCBJointModel(hparams)
+
+        ]
+
+        algo_prefix = 'baseline_epochs={}_m={}_layern={}_beta={}_lambda0={}_rbf-sigma={}_maxnum={}'.format(
+            hparams.num_steps, min(hparams.layer_sizes), hparams.layer_n, \
+            hparams.beta, hparams.lambd0, lin_hparams.rbf_sigma, lin_hparams.max_num_sample
+        )
+
+    if FLAGS.algo_group == 'kern': # for tuning KernLCB
+        algos = [
+            UniformSampling(lin_hparams),
+            KernLCB(lin_hparams), 
+        ]
+
+        algo_prefix = 'kern-gridsearch_beta={}_rbf-sigma={}_maxnum={}'.format(
+            hparams.beta, lin_hparams.rbf_sigma, lin_hparams.max_num_sample
+        )
+
+    if FLAGS.algo_group == 'neurallinlcb': # Tune NeuralLinLCB seperately  
+        algos = [
+            UniformSampling(lin_hparams),
+            ApproxNeuralLinLCBJointModel(hparams)
+        ]
+
+        algo_prefix = 'neurallinlcb-gridsearch_m={}_layern={}_beta={}_lambda0={}'.format(
+            min(hparams.layer_sizes), hparams.layer_n, hparams.beta, hparams.lambd0
+        )
+
+    if FLAGS.algo_group == 'robust-offline':
+        algos = [
+            RobustOfflineBatchNeuraLCB(hparams)
+        ]
+        algo_prefix = 'robust_{}_risk={}_tau={}_beta={}'.format(
+            FLAGS.data_type, FLAGS.risk_measure, FLAGS.tau_n, FLAGS.beta
+        )
+
+    #==============================
+    # W&B Init
+    #==============================
+    if FLAGS.use_wandb is True:
+        wandb.init(
+            project=FLAGS.wandb_project,
+            entity=FLAGS.wandb_entity,
+            config=edict({**FLAGS.flag_values_dict(), **hparams}),
+            name=algo_prefix
+        )
+
+    #==============================
+    # Runner 
+    #==============================
+    file_name = os.path.join(res_dir, algo_prefix) + '.npz' 
+
+    if FLAGS.algo_group == 'robust-offline':
+        # Special runner for pure batch offline algorithms
+        all_regrets = []
+        all_accs = []
+        
+        for sim in range(FLAGS.num_sim):
+            print(f'Simulation: {sim + 1}/{FLAGS.num_sim}')
+            # 1. Reset data and algo
+            contexts, actions, rewards, test_ctx, test_mean = data.reset_data(sim)
+            # rewards is (N, num_actions) but behavior only selected actions[i]
+            # Convert to (N,) raw rewards for train_offline_batch
+            n = contexts.shape[0]
+            beh_rewards = rewards[np.arange(n), actions.ravel()]
+            
+            algo = algos[0]
+            algo.reset(sim * 1111)
+            
+            # 2. Train Batch
+            algo.train_offline_batch(contexts, actions, beh_rewards)
+
+            # 2.5 Save Model
+            if hasattr(algo, 'save_model'):
+                save_path = FLAGS.save_model_path.replace('.pkl', f'_sim{sim}.pkl')
+                os.makedirs(os.path.dirname(save_path), exist_ok=True)
+                algo.save_model(save_path)
+            
+            # 3. Test
+            test_actions = algo.sample_action(test_ctx)
+            sel_vals = test_mean[np.arange(data.num_test_contexts), test_actions.ravel()]
+            opt_vals = np.max(test_mean, axis=1)
+            opt_actions = np.argmax(test_mean, axis=1)
+            
+            regret = np.mean(opt_vals - sel_vals)
+            acc = np.mean(test_actions.ravel() == opt_actions.ravel())
+            
+            # 4. Global Evaluation
+            eval_results = algo.evaluate_offline_policy(contexts, actions)
+            
+            print(f'Regret: {regret:.4f} | Acc: {acc:.4f} | Risk: {eval_results["marginal_risk"]:.4f}')
+            
+            if FLAGS.use_wandb:
+                wandb.log({
+                    "sim": sim,
+                    "test_regret": regret,
+                    "test_accuracy": acc,
+                    "marginal_risk": eval_results["marginal_risk"],
+                    "mean_uncertainty_R": eval_results["mean_uncertainty_R"] if "mean_uncertainty_R" in eval_results else eval_results.get("mean_R_pi", 0)
+                })
+            
+            all_regrets.append(regret)
+            all_accs.append(acc)
+            
+        regrets = np.array(all_regrets, dtype=np.float32).reshape(FLAGS.num_sim, 1, 1)
+        errs = (1.0 - np.array(all_accs, dtype=np.float32)).reshape(FLAGS.num_sim, 1, 1)
+    else:
+        regrets, errs = contextual_bandit_runner(algos, data, FLAGS.num_sim, 
+            FLAGS.update_freq, FLAGS.test_freq, FLAGS.verbose, FLAGS.debug, FLAGS.normalize, file_name)
+
+    np.savez(file_name, regrets, errs)
+
+    if FLAGS.use_wandb:
+        wandb.finish()
+
+
+if __name__ == '__main__': 
+    app.run(main)
