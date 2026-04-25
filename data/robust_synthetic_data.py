@@ -69,17 +69,7 @@ class RobustSyntheticData:
         test_mean_r = get_mean_rewards(test_contexts)
 
         # 4. Generate Noise
-        def generate_noise(shape):
-            if self.noise_type == 'student-t':
-                 return np.random.standard_t(df=2.1, size=shape)
-            elif self.noise_type == 'binary-heavy':
-                 delta = np.sqrt(1.0 / (40 * self.num_contexts))
-                 return np.random.choice([-1/delta, 1/delta, -delta, delta], 
-                                         size=shape, p=[0.01, 0.01, 0.49, 0.49])
-            else: # gaussian
-                 return np.random.normal(0, self.noise_std, size=shape)
-
-        noise = generate_noise(train_mean_r.shape)
+        noise = self.generate_noise(train_mean_r.shape)
         rewards = train_mean_r + noise
         
         # 5. Offline Data Collection
@@ -87,3 +77,13 @@ class RobustSyntheticData:
         
         # In this shared-context model, train_contexts is already (N, d)
         return train_contexts, actions, rewards, test_contexts, test_mean_r
+
+    def generate_noise(self, shape):
+        if self.noise_type == 'student-t':
+                return np.random.standard_t(df=2.1, size=shape)
+        elif self.noise_type == 'binary-heavy':
+                delta = np.sqrt(1.0 / (40 * self.num_contexts))
+                return np.random.choice([-1/delta, 1/delta, -delta, delta], 
+                                        size=shape, p=[0.01, 0.01, 0.49, 0.49])
+        else: # gaussian
+                return np.random.normal(0, self.noise_std, size=shape)

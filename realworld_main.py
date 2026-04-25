@@ -309,9 +309,6 @@ def main(unused_argv):
             # 4. Global Policy Evaluation
             
             # 4.1 Model-based Risk Estimate (using Neural Network predictions)
-            # Evaluation of the Behavior Policy (Offline Data)
-            behavior_eval = algo.evaluate_offline_policy(contexts, actions)
-
             # Evaluation of the Learned Policy (Target)
             learned_train_actions = algo.sample_action(contexts)
             learned_eval = algo.evaluate_offline_policy(contexts, learned_train_actions)
@@ -337,7 +334,6 @@ def main(unused_argv):
                 gt_str = ""
 
             print(f'Regret: {regret:.4f} | Acc: {acc:.4f}{gt_str}')
-            print(f'Model Risk (Data): {behavior_eval["marginal_risk"]:.4f}')
             print(f'Model Risk (Policy): {learned_eval["marginal_risk"]:.4f}')
             
             if FLAGS.use_wandb:
@@ -345,7 +341,6 @@ def main(unused_argv):
                     "sim": sim,
                     "test_regret": regret,
                     "test_accuracy": acc,
-                    "model_data_risk": behavior_eval["marginal_risk"],
                     "model_policy_risk": learned_eval["marginal_risk"]
                 }
                 if FLAGS.data_type == 'robust_syn':
