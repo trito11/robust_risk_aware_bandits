@@ -306,26 +306,51 @@ def main(unused_argv):
             regret = np.mean(opt_vals - sel_vals)
             acc = np.mean(test_actions.ravel() == opt_actions.ravel())
             
-            # 4. Global Evaluation
-            # 4.1 Risk of Behavior Policy (Offline Data)
+            # 4. Global Policy Evaluation
+            
+            # 4.1 Model-based Risk Estimate (using Neural Network predictions)
+            # Evaluation of the Behavior Policy (Offline Data)
             behavior_eval = algo.evaluate_offline_policy(contexts, actions)
 
-            # 4.2 Risk of Learned Policy (Target)
+            # Evaluation of the Learned Policy (Target)
             learned_train_actions = algo.sample_action(contexts)
             learned_eval = algo.evaluate_offline_policy(contexts, learned_train_actions)
 
-            print(f'Regret: {regret:.4f} | Acc: {acc:.4f}')
-            print(f'Risk (Offline Data): {behavior_eval["marginal_risk"]:.4f}')
-            print(f'Risk (Learned Policy): {learned_eval["marginal_risk"]:.4f}')
+            # 4.2 Ground Truth Risk (Oracle Evaluation using Simulator)
+            # This calculates the actual risk the agent would face in the environment.
+            # Only possible for 'robust_syn' where ground truth is known.
+            if FLAGS.data_type == 'robust_syn':
+                # Fetch actions proposal from Agent
+                test_actions_eval = algo.sample_action(test_ctx)
+                # Get True Expected Rewards (no noise)
+                true_means = test_mean[np.arange(test_mean.shape[0]), test_actions_eval.ravel()]
+                # Generate a single realization of stochastic noise
+                fresh_noise = data.generate_noise(true_means.shape)
+                # Calculate the final stochastic reward for each sample
+                true_noisy_rewards = true_means + fresh_noise
+                # Compute Ground Truth CVaR (alpha=0.05)
+                sorted_r = np.sort(true_noisy_rewards)
+                gt_cvar = np.mean(sorted_r[:int(FLAGS.alpha * len(sorted_r))])
+                gt_str = f" | GT CVaR: {gt_cvar:.4f}"
+            else:
+                gt_cvar = 0.0
+                gt_str = ""
+
+            print(f'Regret: {regret:.4f} | Acc: {acc:.4f}{gt_str}')
+            print(f'Model Risk (Data): {behavior_eval["marginal_risk"]:.4f}')
+            print(f'Model Risk (Policy): {learned_eval["marginal_risk"]:.4f}')
             
             if FLAGS.use_wandb:
-                wandb.log({
+                log_data = {
                     "sim": sim,
                     "test_regret": regret,
                     "test_accuracy": acc,
-                    "offline_data_risk": behavior_eval["marginal_risk"],
-                    "learned_policy_risk": learned_eval["marginal_risk"]
-                })
+                    "model_data_risk": behavior_eval["marginal_risk"],
+                    "model_policy_risk": learned_eval["marginal_risk"]
+                }
+                if FLAGS.data_type == 'robust_syn':
+                    log_data["gt_cvar"] = gt_cvar
+                wandb.log(log_data)
             
             all_regrets.append(regret)
             all_accs.append(acc)
