@@ -38,14 +38,20 @@ def collect_simglucose_data(n_train=8000, n_test=2000, save_path='data/simglucos
 
     # Resume logic: Load existing data if available
     if os.path.exists(save_path):
-        print(f"Resuming from existing data: {save_path}")
-        d = np.load(save_path)
-        train_contexts = list(d['train_contexts'])
-        train_actions = list(d['train_actions'])
-        train_rewards = list(d['train_rewards'])
-        test_contexts = list(d['test_contexts'])
-        test_mean_matrix = list(d['test_mean'])
-        print(f"Resumed {len(train_contexts)} train and {len(test_contexts)} test samples.")
+        try:
+            d = np.load(save_path)
+            # Support both old and new key names
+            train_contexts = list(d['train_contexts']) if 'train_contexts' in d else (list(d['contexts']) if 'contexts' in d else [])
+            train_actions = list(d['train_actions']) if 'train_actions' in d else (list(d['actions']) if 'actions' in d else [])
+            train_rewards = list(d['train_rewards']) if 'train_rewards' in d else (list(d['rewards']) if 'rewards' in d else [])
+            
+            # test_mean/test_contexts might not exist in older versions
+            test_contexts = list(d['test_contexts']) if 'test_contexts' in d else []
+            test_mean_matrix = list(d['test_mean']) if 'test_mean' in d else []
+            
+            print(f"Resumed {len(train_contexts)} train and {len(test_contexts)} test samples.")
+        except Exception as e:
+            print(f"Error loading existing data: {e}. Starting fresh.")
 
     total_existing = len(train_contexts) + len(test_contexts)
     if total_existing >= (n_train + n_test):
