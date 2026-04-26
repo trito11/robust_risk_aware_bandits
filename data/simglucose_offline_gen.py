@@ -41,29 +41,32 @@ def collect_simglucose_data(n_train=8000, n_test=2000, save_path='data/simglucos
         try:
             d = np.load(save_path)
             # Support both old and new key names
-            train_contexts = list(d['train_contexts']) if 'train_contexts' in d else (list(d['contexts']) if 'contexts' in d else [])
-            train_actions = list(d['train_actions']) if 'train_actions' in d else (list(d['actions']) if 'actions' in d else [])
-            train_rewards = list(d['train_rewards']) if 'train_rewards' in d else (list(d['rewards']) if 'rewards' in d else [])
+            res_train_ctx = list(d['train_contexts']) if 'train_contexts' in d else (list(d['contexts']) if 'contexts' in d else [])
+            res_train_act = list(d['train_actions']) if 'train_actions' in d else (list(d['actions']) if 'actions' in d else [])
+            res_train_rew = list(d['train_rewards']) if 'train_rewards' in d else (list(d['rewards']) if 'rewards' in d else [])
             
-            # test_mean/test_contexts might not exist in older versions
-            test_contexts = list(d['test_contexts']) if 'test_contexts' in d else []
-            test_mean_matrix = list(d['test_mean']) if 'test_mean' in d else []
+            res_test_ctx = list(d['test_contexts']) if 'test_contexts' in d else []
+            res_test_mean = list(d['test_mean']) if 'test_mean' in d else []
             
-            print(f"Resumed {len(train_contexts)} train and {len(test_contexts)} test samples.")
+            # Only keep data if it has the correct 4-dimensional context
+            if len(res_train_ctx) > 0 and len(res_train_ctx[0]) == 4:
+                train_contexts = res_train_ctx
+                train_actions = res_train_act
+                train_rewards = res_train_rew
+                test_contexts = res_test_ctx
+                test_mean_matrix = res_test_mean
+                print(f"Resumed {len(train_contexts)} train and {len(test_contexts)} test samples (4D verified).")
+            else:
+                print("Old 3D data format or empty file detected. Starting fresh to support 4 patients.")
         except Exception as e:
             print(f"Error loading existing data: {e}. Starting fresh.")
-
-    total_existing = len(train_contexts) + len(test_contexts)
-    if total_existing >= (n_train + n_test):
-        print("Dataset already complete.")
-        return
 
     print(f"Targeting {n_train} train and {n_test} test samples across 4 patients.")
 
     for p_idx, p_name in enumerate(patient_names):
-        # Calculate how many samples we already have for THIS patient
-        current_p_train = len([c for c in train_contexts if c[2] == p_idx])
-        current_p_test = len([c for c in test_contexts if c[2] == p_idx])
+        # Calculate how many valid samples we already have for THIS patient (based on p_idx at index 2)
+        current_p_train = len([c for c in train_contexts if int(c[2]) == p_idx])
+        current_p_test = len([c for c in test_contexts if int(c[2]) == p_idx])
         
         if current_p_train + current_p_test >= samples_per_patient:
             print(f"Patient {p_name} already completed. Skipping.")
