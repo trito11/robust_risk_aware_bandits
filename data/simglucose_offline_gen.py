@@ -6,141 +6,143 @@ from simglucose.actuator.pump import InsulinPump
 from simglucose.sensor.cgm import CGMSensor
 from simglucose.patient.t1dpatient import T1DPatient
 from simglucose.simulation.scenario_gen import RandomScenario
-from datetime import datetime, timedelta
+from datetime import datetime
 import os
-import copy
 from tqdm import tqdm
 
 def get_magni_reward(bg_history):
-    """
-    Calculate Magni Risk Score. Higher is safer.
-    Magni function: Risk = 1.509 * (log(BG)^1.084 - 5.381)
-    We take the negative risk as reward.
-    """
+    if not bg_history: return -500.0
     bg_history = np.array(bg_history)
-    bg_history[bg_history < 1] = 1 # Avoid log(0)
+    bg_history[bg_history < 1] = 1 
     risk = 1.509 * (np.power(np.log(bg_history), 1.084) - 5.381)
     risk_score = 10 * np.power(risk, 2)
-    return -np.mean(risk_score) # Average risk over the 4-hour window
+    return -np.mean(risk_score)
+
+def create_env_at_state(p_name, seed, current_time):
+    patient = T1DPatient.withName(p_name)
+    sensor = CGMSensor.withName('Dexcom', seed=seed)
+    pump = InsulinPump.withName('Insulet')
+    scenario = RandomScenario(start_time=current_time, seed=seed)
+    env = T1DSimEnv(patient, sensor, pump, scenario)
+    env.reset()
+    env.time = current_time
+    return env
 
 def collect_simglucose_data(n_train=8000, n_test=2000, save_path='data/simglucose_offline.npz'):
-    """
-    Advanced Medical Bandit Generator following paper setup.
-    """
     patient_names = ['child#001', 'child#002', 'adolescent#001', 'adult#001']
-    n_samples = n_train + n_test
-    samples_per_patient = n_samples // len(patient_names)
-    
+    samples_per_patient = (n_train + n_test) // len(patient_names)
+    test_per_patient = n_test // len(patient_names)
+
     train_contexts, train_actions, train_rewards = [], [], []
     test_contexts, test_mean_matrix = [], []
 
-    print(f"Upgrading Simglucose to Proper Medical Bandit...")
-    print(f"- Patients: {patient_names}")
-    print(f"- Window: 4 hours (240 mins) post-bolus")
-    print(f"- Actions: 11 levels (0-10 units)")
+    # Resume logic: Load existing data if available
+    if os.path.exists(save_path):
+        print(f"Resuming from existing data: {save_path}")
+        d = np.load(save_path)
+        train_contexts = list(d['train_contexts'])
+        train_actions = list(d['train_actions'])
+        train_rewards = list(d['train_rewards'])
+        test_contexts = list(d['test_contexts'])
+        test_mean_matrix = list(d['test_mean'])
+        print(f"Resumed {len(train_contexts)} train and {len(test_contexts)} test samples.")
+
+    total_existing = len(train_contexts) + len(test_contexts)
+    if total_existing >= (n_train + n_test):
+        print("Dataset already complete.")
+        return
+
+    print(f"Targeting {n_train} train and {n_test} test samples across 4 patients.")
 
     for p_idx, p_name in enumerate(patient_names):
-        print(f"\nProcessing clinical data for: {p_name}")
+        # Calculate how many samples we already have for THIS patient
+        current_p_train = len([c for c in train_contexts if c[2] == p_idx])
+        current_p_test = len([c for c in test_contexts if c[2] == p_idx])
         
-        # We use a long simulation to find enough meal events
-        start_time = datetime(2024, 1, 1, 0, 0, 0)
-        scenario = RandomScenario(start_time=start_time, seed=p_idx)
-        patient = T1DPatient.withName(p_name)
-        sensor = CGMSensor.withName('Dexcom', seed=p_idx)
-        pump = InsulinPump.withName('Insulet')
-        env = T1DSimEnv(patient, sensor, pump, scenario)
-        controller = BBController()
+        if current_p_train + current_p_test >= samples_per_patient:
+            print(f"Patient {p_name} already completed. Skipping.")
+            continue
 
+        print(f"\nProcessing: {p_name}")
+        start_date = datetime(2024, 1, 1, 0, 0, 0)
+        scenario = RandomScenario(start_time=start_date, seed=p_idx)
+        env = T1DSimEnv(T1DPatient.withName(p_name), CGMSensor.withName('Dexcom', seed=p_idx), 
+                        InsulinPump.withName('Insulet'), scenario)
+        controller = BBController()
         state, reward, done, info = env.reset()
+
+        pbar = tqdm(total=samples_per_patient, initial=current_p_train + current_p_test)
         
-        count = 0
-        pbar = tqdm(total=samples_per_patient, desc=f"Patient {p_idx}")
-        
-        while count < samples_per_patient:
-            # Advance environment until a meal occurs
+        patient_count = current_p_train + current_p_test
+        while patient_count < samples_per_patient:
             meal = env.scenario.get_action(env.time).meal
             if meal > 0:
-                # 1. Capture Context
-                bg = state.CGM
-                ctx = np.array([bg, meal, float(p_idx), 0.5])
+                ctx = np.array([state.CGM, meal, float(p_idx), 0.5])
+                is_test = (patient_count >= (samples_per_patient - test_per_patient))
                 
-                # Identify if this sample belongs to Train or Test
-                is_test = (count >= (samples_per_patient - (n_test // 4)))
-                
-                if not is_test:
-                    # TRAINING MODE: Simulate only the behavior action
-                    ctrl_action = controller.policy(state, reward, done, **info)
-                    bolus = ctrl_action.bolus
-                    if np.random.rand() < 0.3: # Add sub-optimality
-                         bolus += np.random.uniform(-2, 2)
-                    bolus = int(np.round(max(0, min(10, bolus))))
-                    
-                    # Simulation: Run for 240 minutes
-                    bg_window = []
-                    curr_env = copy.deepcopy(env) # Snapshot
-                    act = ctrl_action._replace(bolus=bolus)
-                    
-                    for _ in range(240): # 4 hours
-                        s, r, d, i = curr_env.step(act)
-                        bg_window.append(s.CGM)
-                        act = ctrl_action._replace(bolus=0) # Only first step has bolus
-                    
-                    train_contexts.append(ctx)
-                    train_actions.append(bolus)
-                    train_rewards.append(get_magni_reward(bg_window))
-                else:
-                    # TEST MODE: Oracle Evaluation (Simulate ALL 11 actions)
-                    action_rewards = []
-                    for a in range(11):
-                        curr_env = copy.deepcopy(env)
+                try:
+                    if not is_test:
+                        # Collect Train Data
                         ctrl_action = controller.policy(state, reward, done, **info)
-                        act = ctrl_action._replace(bolus=a)
+                        bolus = ctrl_action.bolus
+                        if np.random.rand() < 0.3: bolus += np.random.uniform(-2, 2)
+                        bolus = int(np.round(max(0, min(10, bolus))))
                         
+                        temp_env = create_env_at_state(p_name, p_idx, env.time)
                         bg_window = []
-                        for _ in range(240):
-                            s, r, d, i = curr_env.step(act)
+                        act = ctrl_action._replace(bolus=bolus)
+                        for _ in range(180): # 3 hours
+                            s, _, _, _ = temp_env.step(act)
                             bg_window.append(s.CGM)
                             act = ctrl_action._replace(bolus=0)
-                        action_rewards.append(get_magni_reward(bg_window))
+                        
+                        train_contexts.append(ctx)
+                        train_actions.append(bolus)
+                        train_rewards.append(get_magni_reward(bg_window))
+                    else:
+                        # Collect Test Data (Oracle)
+                        action_rewards = []
+                        for a in range(11):
+                            temp_env = create_env_at_state(p_name, p_idx, env.time)
+                            ctrl_action = controller.policy(state, reward, done, **info)
+                            act = ctrl_action._replace(bolus=a)
+                            bg_window = []
+                            for _ in range(180):
+                                s, _, _, _ = temp_env.step(act)
+                                bg_window.append(s.CGM)
+                                act = ctrl_action._replace(bolus=0)
+                            action_rewards.append(get_magni_reward(bg_window))
+                        
+                        test_contexts.append(ctx)
+                        test_mean_matrix.append(action_rewards)
                     
-                    test_contexts.append(ctx)
-                    test_mean_matrix.append(action_rewards)
+                    patient_count += 1
+                    pbar.update(1)
+                    
+                    # Save checkpoint every 50 samples to prevent data loss
+                    if patient_count % 50 == 0:
+                        np.savez(save_path, 
+                                 train_contexts=np.array(train_contexts), 
+                                 train_actions=np.array(train_actions), 
+                                 train_rewards=np.array(train_rewards), 
+                                 test_contexts=np.array(test_contexts), 
+                                 test_mean=np.array(test_mean_matrix))
+                                 
+                except Exception:
+                    pass # Skip ODE errors
 
-                count += 1
-                pbar.update(1)
-            
-            # Normal env step to next minute
             state, reward, done, info = env.step(controller.policy(state, reward, done, **info)._replace(bolus=0))
             if done: env.reset()
         pbar.close()
 
-    # Convert to arrays
-    train_contexts = np.array(train_contexts)
-    train_actions = np.array(train_actions)
-    train_rewards = np.array(train_rewards)
-    
-    test_contexts = np.array(test_contexts)
-    test_mean_matrix = np.array(test_mean_matrix)
-
-    # Calculate biological clean rewards for training (without sensor failure noise)
-    rewards_clean = train_rewards.copy()
-
-    # Add Heavy-tailed nose (Outliers) to 5% of training samples
-    outlier_idx = np.random.choice(len(train_rewards), int(len(train_rewards) * 0.05), replace=False)
-    train_rewards[outlier_idx] += np.random.choice([-500, 500], size=len(outlier_idx))
-
-    os.makedirs('data', exist_ok=True)
+    # Final Save
     np.savez(save_path, 
-             train_contexts=train_contexts, 
-             train_actions=train_actions, 
-             train_rewards=train_rewards,
-             test_contexts=test_contexts,
-             test_mean=test_mean_matrix,
-             rewards_clean=rewards_clean)
-    
-    print(f"\nUpgrade complete! Data saved to {save_path}")
-    print(f"- Train size: {len(train_contexts)}")
-    print(f"- Test size: {len(test_contexts)} (with full 11-action oracle matrix)")
+             train_contexts=np.array(train_contexts), 
+             train_actions=np.array(train_actions), 
+             train_rewards=np.array(train_rewards), 
+             test_contexts=np.array(test_contexts), 
+             test_mean=np.array(test_mean_matrix))
+    print(f"\nSuccess! Total samples: {len(train_contexts) + len(test_contexts)}")
 
 if __name__ == "__main__":
     collect_simglucose_data()
