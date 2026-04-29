@@ -8,7 +8,7 @@ import os
 import time 
 
 from core.contextual_bandit import contextual_bandit_runner
-from algorithms.neural_offline_bandit import ExactNeuraLCBV2, NeuralGreedyV2, ApproxNeuraLCBV2, RobustOfflineBatchNeuraLCB
+from algorithms.neural_offline_bandit import ExactNeuraLCBV2, NeuralGreedyV2, ApproxNeuraLCBV2, RobustOfflineBatchNeuraLCB, NeuralRegressionOffline
 from algorithms.lin_lcb import LinLCB 
 from algorithms.kern_lcb import KernLCB 
 from algorithms.uniform_sampling import UniformSampling
@@ -204,6 +204,17 @@ def main(unused_argv):
             FLAGS.data_type, FLAGS.risk_measure, FLAGS.tau_n, FLAGS.beta, FLAGS.num_contexts, layer_str
         )
 
+    if FLAGS.algo_group == 'neural-regression':
+        # Compare pure neural regression (no pessimism/risk) vs risk-aware LCB
+        layer_str = "-".join([str(s) for s in layer_sizes])
+        algos = [
+            NeuralRegressionOffline(hparams),
+            RobustOfflineBatchNeuraLCB(hparams),
+        ]
+        algo_prefix = 'neural_regression_{}_risk={}_tau={}_beta={}_n={}_layers={}'.format(
+            FLAGS.data_type, FLAGS.risk_measure, FLAGS.tau_n, FLAGS.beta, FLAGS.num_contexts, layer_str
+        )
+
     #==============================
     # W&B Init
     #==============================
@@ -220,123 +231,137 @@ def main(unused_argv):
     #==============================
     file_name = os.path.join(res_dir, algo_prefix) + '.npz' 
 
-    if FLAGS.algo_group == 'robust-offline':
-        all_regrets = []
-        all_accs = []
-        all_times = []
-        all_gt_cvars = []
+    if FLAGS.algo_group in ('robust-offline', 'neural-regression'):
+        # -------------------------------------------------------
+        # Generic offline batch runner – works for any group that
+        # uses the train_offline_batch / sample_action interface.
+        # Each algo in `algos` is evaluated independently on the
+        # same dataset for each simulation seed.
+        # -------------------------------------------------------
+        num_algos = len(algos)
+        algo_names = [a.name for a in algos]
+
+        # Per-algo accumulators
+        all_regrets   = [[] for _ in range(num_algos)]
+        all_accs      = [[] for _ in range(num_algos)]
+        all_gt_cvars  = [[] for _ in range(num_algos)]
+        all_gt_means  = [[] for _ in range(num_algos)]
+        all_gt_vars   = [[] for _ in range(num_algos)]
         all_oracle_cvars = []
-        all_gt_means = []
-        all_gt_vars = []
         all_oracle_means = []
-        all_oracle_vars = []
-        
+        all_oracle_vars  = []
+        all_times        = [[] for _ in range(num_algos)]
+
         for sim in range(FLAGS.num_sim):
-            t0 = time.time()
             print(f'Simulation: {sim + 1}/{FLAGS.num_sim}')
-            
-            # 1. Reset data and algo
+
+            # 1. Reset data (same seed for all algos in a simulation)
             contexts, actions, rewards, test_ctx, test_mean = data.reset_data(sim)
-            
-            # behavior rewards only for selected actions (for training)
+
             if len(rewards.shape) > 1:
-                # For synthetic data where 'rewards' is (N, K)
                 n = contexts.shape[0]
                 beh_rewards = rewards[np.arange(n), actions.ravel()]
             else:
-                # For data already split (simglucose), 'rewards' is already (N,)
-                beh_rewards = rewards 
-            
-            algo = algos[0]
-            algo.reset(sim * 1111)
-            
-            # 2. Train Batch
-            algo.train_offline_batch(contexts, actions, beh_rewards)
+                beh_rewards = rewards
 
-            # 3. Policy Evaluation (Run action selection once)
-            test_actions = algo.sample_action(test_ctx)
             opt_actions = np.argmax(test_mean, axis=1)
-            
-            # 3.1 Calculate True Regret and Accuracy
             opt_vals = test_mean[np.arange(test_mean.shape[0]), opt_actions.ravel()]
-            sel_vals = test_mean[np.arange(test_mean.shape[0]), test_actions.ravel()]
-            
-            regret = np.mean(opt_vals - sel_vals)
-            acc = np.mean(test_actions.ravel() == opt_actions.ravel())
-            
-            # 3.2 Calculate Ground Truth Risks (Oracle Evaluation)
+
+            # Oracle noise (computed once per sim)
             if FLAGS.data_type == 'robust_syn':
-                # Agent 
-                fresh_noise = data.generate_noise(sel_vals.shape)
-                agent_noisy_r = sel_vals + fresh_noise
-                # Oracle
                 oracle_noise = data.generate_noise(opt_vals.shape)
                 oracle_noisy_r = opt_vals + oracle_noise
             elif FLAGS.data_type == 'simglucose':
-                # Simglucose already contains realized rewards in its matrix
-                agent_noisy_r = sel_vals
                 oracle_noisy_r = opt_vals
             else:
-                agent_noisy_r, oracle_noisy_r = None, None
+                oracle_noisy_r = None
 
-            if agent_noisy_r is not None:
-                # Calculate Agent stats
-                gt_mean = np.mean(agent_noisy_r)
-                gt_var = np.var(agent_noisy_r)
-                sorted_agent = np.sort(agent_noisy_r)
-                gt_cvar = np.mean(sorted_agent[:int(FLAGS.alpha * len(sorted_agent))])
-
-                # Calculate Oracle stats
+            if oracle_noisy_r is not None:
                 oracle_mean = np.mean(oracle_noisy_r)
-                oracle_var = np.var(oracle_noisy_r)
+                oracle_var  = np.var(oracle_noisy_r)
                 sorted_oracle = np.sort(oracle_noisy_r)
                 oracle_cvar = np.mean(sorted_oracle[:int(FLAGS.alpha * len(sorted_oracle))])
-
-                stat_str = f" | GT Mean/Var/CVaR: {gt_mean:.2f}/{gt_var:.2f}/{gt_cvar:.2f}"
-                ora_str = f" | Oracle Mean/Var/CVaR: {oracle_mean:.2f}/{oracle_var:.2f}/{oracle_cvar:.2f}"
-                print(f'Regret: {regret:.4f} | Acc: {acc:.4f}{stat_str}{ora_str}')
             else:
-                gt_mean = gt_var = gt_cvar = 0.0
                 oracle_mean = oracle_var = oracle_cvar = 0.0
-                print(f'Regret: {regret:.4f} | Acc: {acc:.4f}')
-            
-            if FLAGS.use_wandb:
-                log_data = {
-                    "sim": sim, "test_regret": regret, "test_accuracy": acc,
-                    "gt_mean": gt_mean, "gt_var": gt_var, "gt_cvar": gt_cvar,
-                    "oracle_mean": oracle_mean, "oracle_var": oracle_var, "oracle_cvar": oracle_cvar
-                }
-                wandb.log(log_data)
-            
-            all_regrets.append(regret)
-            all_accs.append(acc)
-            all_times.append(time.time() - t0)
-            all_gt_cvars.append(gt_cvar)
-            all_oracle_cvars.append(oracle_cvar)
-            all_gt_means.append(gt_mean)
-            all_gt_vars.append(gt_var)
+
             all_oracle_means.append(oracle_mean)
             all_oracle_vars.append(oracle_var)
-            
-        regrets = np.array(all_regrets, dtype=np.float32).reshape(FLAGS.num_sim, 1, 1)
-        errs = (1.0 - np.array(all_accs, dtype=np.float32)).reshape(FLAGS.num_sim, 1, 1)
-        
+            all_oracle_cvars.append(oracle_cvar)
+
+            # 2. Train + evaluate each algo
+            for ai, algo in enumerate(algos):
+                t0 = time.time()
+                algo.reset(sim * 1111)
+                algo.train_offline_batch(contexts, actions, beh_rewards)
+
+                test_actions = algo.sample_action(test_ctx)
+                sel_vals = test_mean[np.arange(test_mean.shape[0]), test_actions.ravel()]
+
+                regret = np.mean(opt_vals - sel_vals)
+                acc    = np.mean(test_actions.ravel() == opt_actions.ravel())
+
+                # Ground-truth risk stats
+                if FLAGS.data_type == 'robust_syn':
+                    fresh_noise   = data.generate_noise(sel_vals.shape)
+                    agent_noisy_r = sel_vals + fresh_noise
+                elif FLAGS.data_type == 'simglucose':
+                    agent_noisy_r = sel_vals
+                else:
+                    agent_noisy_r = None
+
+                if agent_noisy_r is not None:
+                    gt_mean = np.mean(agent_noisy_r)
+                    gt_var  = np.var(agent_noisy_r)
+                    sorted_agent = np.sort(agent_noisy_r)
+                    gt_cvar = np.mean(sorted_agent[:int(FLAGS.alpha * len(sorted_agent))])
+                else:
+                    gt_mean = gt_var = gt_cvar = 0.0
+
+                elapsed = time.time() - t0
+                print(f'  [{algo.name}] Regret={regret:.4f} | Acc={acc:.4f} '
+                      f'| GT Mean/Var/CVaR={gt_mean:.2f}/{gt_var:.2f}/{gt_cvar:.2f} '
+                      f'| Oracle CVaR={oracle_cvar:.2f} | t={elapsed:.1f}s')
+
+                if FLAGS.use_wandb:
+                    wandb.log({
+                        "sim": sim, "algo": algo.name,
+                        "test_regret": regret, "test_accuracy": acc,
+                        "gt_mean": gt_mean, "gt_var": gt_var, "gt_cvar": gt_cvar,
+                        "oracle_mean": oracle_mean, "oracle_var": oracle_var, "oracle_cvar": oracle_cvar,
+                    })
+
+                all_regrets[ai].append(regret)
+                all_accs[ai].append(acc)
+                all_gt_cvars[ai].append(gt_cvar)
+                all_gt_means[ai].append(gt_mean)
+                all_gt_vars[ai].append(gt_var)
+                all_times[ai].append(elapsed)
+
+        # 3. Save results – one array per algo, keyed by algo name
         save_dict = {
-            "regrets": regrets,
-            "errs": errs,
-            "times": np.array(all_times),
-            "gt_cvars": np.array(all_gt_cvars),
-            "oracle_cvars": np.array(all_oracle_cvars),
-            "gt_means": np.array(all_gt_means),
-            "gt_vars": np.array(all_gt_vars),
-            "oracle_means": np.array(all_oracle_means),
-            "oracle_vars": np.array(all_oracle_vars)
+            "algo_names": np.array(algo_names),
+            "oracle_cvars":  np.array(all_oracle_cvars),
+            "oracle_means":  np.array(all_oracle_means),
+            "oracle_vars":   np.array(all_oracle_vars),
         }
+        for ai, name in enumerate(algo_names):
+            safe = name.replace(' ', '_')
+            save_dict[f"{safe}_regrets"] = np.array(all_regrets[ai], dtype=np.float32)
+            save_dict[f"{safe}_accs"]    = np.array(all_accs[ai],    dtype=np.float32)
+            save_dict[f"{safe}_gt_cvars"]= np.array(all_gt_cvars[ai],dtype=np.float32)
+            save_dict[f"{safe}_gt_means"]= np.array(all_gt_means[ai],dtype=np.float32)
+            save_dict[f"{safe}_gt_vars"] = np.array(all_gt_vars[ai], dtype=np.float32)
+            save_dict[f"{safe}_times"]   = np.array(all_times[ai],   dtype=np.float32)
         np.savez(file_name, **save_dict)
+
+        # Backward-compat: also expose flat regrets/errs for the first algo
+        regrets = np.array(all_regrets[0], dtype=np.float32).reshape(FLAGS.num_sim, 1, 1)
+        errs    = (1.0 - np.array(all_accs[0], dtype=np.float32)).reshape(FLAGS.num_sim, 1, 1)
     else:
-        regrets, errs = contextual_bandit_runner(algos, data, FLAGS.num_sim, 
+        regrets, errs = contextual_bandit_runner(algos, data, FLAGS.num_sim,
             FLAGS.update_freq, FLAGS.test_freq, FLAGS.verbose, FLAGS.debug, FLAGS.normalize, file_name)
         np.savez(file_name, regrets=regrets, errs=errs)
+
 
     if FLAGS.use_wandb:
         wandb.finish()

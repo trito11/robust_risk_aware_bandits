@@ -608,8 +608,9 @@ class RobustOfflineBatchNeuraLCB(BanditAlgorithm):
         """
         measure = getattr(self.hparams, 'risk_measure', 'cvar')
         if measure == 'cvar':
-            # For CVaR at level alpha, the Lipschitz constant is 1/alpha.
-            return 1.0 / self.hparams.alpha
+            # Handle alpha depending on notation (0.95 confidence level vs 0.05 tail)
+            tail_prob = self.hparams.alpha if self.hparams.alpha < 0.5 else (1.0 - self.hparams.alpha)
+            return 1.0 / tail_prob
         elif measure == 'mean':
             return 1.0
         elif measure == 'entropic':
@@ -763,6 +764,111 @@ class RobustOfflineBatchNeuraLCB(BanditAlgorithm):
 
         return jnp.concatenate(all_actions, axis=0)
 
+    def sample_action_milp(self, contexts, noise_samples=None):
+        """Chooses actions by globally maximizing Marginal CVaR using MILP.
+        
+        Unlike `sample_action` which optimizes conditional point-wise CVaR, 
+        this computes the global optimal policy coupling all contexts together.
+        
+        Args:
+            contexts: A batch of contexts to evaluate (shape: I x dim).
+            noise_samples: Optional true noise samples. If None, uses historical residuals.
+        """
+        import gurobipy as gp
+        from gurobipy import GRB
+        import numpy as np
+        
+        assert self.historical_residuals is not None, "Call train_offline_batch() first."
+        assert self.Z_inv is not None, "Call train_offline_batch() first."
+        
+        if noise_samples is None:
+            noise_samples = np.array(self.historical_residuals)
+            
+        I = contexts.shape[0]
+        J = self.hparams.num_actions
+        M = len(noise_samples)
+        
+        if self.hparams.verbose:
+            print(f'[{self.name}] Extracting h_matrix for MILP (I={I}, J={J}, M={M})...')
+            
+        # 1. Build the matrices for mu and R
+        mu_matrix = np.zeros((I, J))
+        R_matrix = np.zeros((I, J))
+        L_rho = self._get_risk_lipschitz_factor()
+        chunk_size = getattr(self.hparams, 'chunk_size', 500)
+        
+        for a in range(J):
+            mu_a_full = []
+            R_a_full = []
+            for i in range(0, I, chunk_size):
+                batch_contexts = contexts[i : i + chunk_size]
+                B = batch_contexts.shape[0]
+                actions_tmp = jnp.ones(shape=(B,)) * a
+                
+                # Mean Prediction
+                mu_a = self.nn.out(self.nn.params, batch_contexts, actions_tmp).ravel()
+                
+                # Uncertainty
+                g_test = self.nn.grad_out(self.nn.params, batch_contexts, actions_tmp) / jnp.sqrt(self.nn.m)
+                R_a = jnp.sqrt(jnp.sum((g_test @ self.Z_inv) * g_test, axis=-1))
+                
+                mu_a_full.append(np.array(mu_a))
+                R_a_full.append(np.array(R_a))
+                
+            mu_matrix[:, a] = np.concatenate(mu_a_full)
+            R_matrix[:, a] = np.concatenate(R_a_full)
+            
+        # 2. Formulate and solve the MILP
+        if self.hparams.verbose:
+            print(f'[{self.name}] Solving Exact Marginal CVaR LCB MILP...')
+            
+        env = gp.Env(empty=True)
+        env.setParam("OutputFlag", 1 if self.hparams.verbose else 0)
+        env.start()
+        model = gp.Model("CVaR_LCB_MILP", env=env)
+        
+        z = model.addVars(I, J, vtype=GRB.BINARY, name="z")
+        q = model.addVar(vtype=GRB.CONTINUOUS, lb=-GRB.INFINITY, name="q")
+        s = model.addVars(I, M, vtype=GRB.CONTINUOUS, lb=0.0, name="s")
+        
+        alpha = getattr(self.hparams, 'alpha', 0.9)
+        tail_prob = alpha if alpha < 0.5 else (1.0 - alpha)
+        
+        # Objective: Exact Marginal CVaR - Uncertainty Penalty
+        # CVaR = q - (1 / (I * M * tail_prob)) * sum(s_im)
+        # Penalty = (beta * L_rho / I) * sum(z_ij * R_ij)
+        beta = self.hparams.beta
+        
+        cvar_expr = q - (1.0 / (I * M * tail_prob)) * gp.quicksum(s[i, m] for i in range(I) for m in range(M))
+        penalty_expr = (beta * L_rho / float(I)) * gp.quicksum(R_matrix[i, j] * z[i, j] for i in range(I) for j in range(J))
+        
+        model.setObjective(cvar_expr - penalty_expr, GRB.MAXIMIZE)
+        
+        for i in range(I):
+            model.addConstr(gp.quicksum(z[i, j] for j in range(J)) == 1)
+            
+        for i in range(I):
+            for m in range(M):
+                # The random variable for CVaR is ONLY (mu + noise)
+                mu_z_sum = gp.quicksum(mu_matrix[i, j] * z[i, j] for j in range(J))
+                model.addConstr(s[i, m] >= q - (mu_z_sum + noise_samples[m]))
+                
+        model.optimize()
+        
+        if model.status == GRB.OPTIMAL:
+            optimal_policy = np.zeros(I, dtype=int)
+            for i in range(I):
+                for j in range(J):
+                    if z[i, j].X > 0.5:
+                        optimal_policy[i] = j
+                        break
+            if self.hparams.verbose:
+                print(f'[{self.name}] MILP solved. Max CVaR LCB = {model.ObjVal:.4f}')
+            return jnp.array(optimal_policy)
+        else:
+            print(f'[{self.name}] MILP failed to find optimal solution. Fallback to point-wise LCB.')
+            return self.sample_action(contexts)
+
     # ------------------------------------------------------------------
     # Global Policy Evaluation
     # ------------------------------------------------------------------
@@ -838,3 +944,559 @@ class RobustOfflineBatchNeuraLCB(BanditAlgorithm):
             print(f'[{self.name}] Residual Mean: {jnp.mean(jnp.abs(self.historical_residuals)):.4f}')
         else:
             print(f'[{self.name}] Model not trained.')
+
+
+# ============================================================
+# ============================================================
+# NeuralRegressionOffline
+# ============================================================
+
+class NeuralRegressionOffline(BanditAlgorithm):
+    """Pure Neural Regression baseline for offline contextual bandits.
+
+    This is the simplest neural baseline in the offline batch setting.
+    It trains a multi-layer perceptron to directly regress G(context, action)
+    via MSE loss, using the same action-convoluted input as NeuralBanditModelV2:
+
+        input = action_convolution(context, action)  # shape: (context_dim * num_actions,)
+        G_hat = MLP(input)                           # scalar reward estimate
+
+    Action selection is purely greedy:
+        pi(context) = argmax_a  G_hat(context, a)
+
+    No uncertainty quantification, no risk functional, no Tofu truncation.
+    This serves as the *lower bound* baseline to compare against pessimistic
+    and risk-aware algorithms (e.g. RobustOfflineBatchNeuraLCB).
+
+    Required hparams (same schema as RobustOfflineBatchNeuraLCB):
+        context_dim  (int):   Dimension of each context vector.
+        num_actions  (int):   Number of discrete actions.
+        layer_sizes  (list):  Hidden layer widths, e.g. [100, 100].
+        lr           (float): Adam learning rate.
+        lambd        (float): L2 regularization weight.
+        num_steps    (int):   Gradient steps for offline training.
+        batch_size   (int):   Mini-batch size per step.
+        buffer_s     (int):   Replay buffer size (-1 = unlimited).
+        data_rand    (bool):  Whether to sample batches randomly.
+        verbose      (bool):  Print training progress.
+    """
+
+    def __init__(self, hparams, update_freq=1, name='NeuralRegressionOffline'):
+        self.name = name
+        self.hparams = hparams
+        self.update_freq = update_freq
+
+        opt = optax.adam(hparams.lr)
+        # NeuralBanditModelV2 already implements:
+        #   input  = action_convolution(context, action)  [context_dim * num_actions]
+        #   output = MLP(input)                           [scalar]
+        #   loss   = 0.5 * MSE + 0.5 * lambd * ||params||^2
+        self.nn = NeuralBanditModelV2(opt, hparams, '{}-net'.format(name))
+
+        self.data = BanditDataset(
+            hparams.context_dim,
+            hparams.num_actions,
+            hparams.buffer_s,
+            '{}-data'.format(name),
+        )
+
+    # ------------------------------------------------------------------
+    # Reset
+    # ------------------------------------------------------------------
+
+    def reset(self, seed):
+        """Reset network weights and replay buffer."""
+        self.nn.reset(seed)
+        self.data.reset()
+
+    # ------------------------------------------------------------------
+    # Offline Batch Training
+    # ------------------------------------------------------------------
+
+    def train_offline_batch(self, contexts, actions, rewards):
+        """Train MLP regressor on the full offline dataset via MSE.
+
+        Args:
+            contexts: (N, context_dim)  – context vectors.
+            actions:  (N,)              – integer action indices in [0, K-1].
+            rewards:  (N,)              – observed scalar rewards.
+        """
+        self.data.reset()
+        self.data.add(contexts, actions.reshape(-1, 1), rewards.reshape(-1, 1))
+        self.nn.train(self.data, self.hparams.num_steps)
+
+        if self.hparams.verbose:
+            # Quick sanity check: in-sample MSE
+            f_hist = self.nn.out(self.nn.params, contexts, actions.ravel()).ravel()
+            mse = float(jnp.mean(jnp.square(f_hist - rewards.ravel())))
+            print(f'[{self.name}] Training complete | in-sample MSE={mse:.4f}')
+
+    # ------------------------------------------------------------------
+    # Action Selection: Greedy Argmax
+    # ------------------------------------------------------------------
+
+    def sample_action(self, contexts):
+        """Select action greedily: pi(x) = argmax_a G_hat(x, a).
+
+        Args:
+            contexts: (M, context_dim)
+
+        Returns:
+            actions: (M,)  integer action indices.
+        """
+        num_contexts = contexts.shape[0]
+        chunk_size = getattr(self.hparams, 'chunk_size', 500)
+        all_actions = []
+
+        for i in range(0, num_contexts, chunk_size):
+            batch_ctx = contexts[i: i + chunk_size]
+            B = batch_ctx.shape[0]
+            preds = []
+            for a in range(self.hparams.num_actions):
+                actions_tmp = jnp.ones(shape=(B,)) * a
+                f_a = self.nn.out(self.nn.params, batch_ctx, actions_tmp).ravel()  # (B,)
+                preds.append(f_a.reshape(-1, 1))
+            pred_matrix = jnp.hstack(preds)   # (B, num_actions)
+            all_actions.append(jnp.argmax(pred_matrix, axis=1))
+
+        return jnp.concatenate(all_actions, axis=0)
+
+    # ------------------------------------------------------------------
+    # Save / Load
+    # ------------------------------------------------------------------
+
+    def save_model(self, path):
+        """Save network weights to a pickle file."""
+        import pickle
+        data = {
+            'nn_params': self.nn.params,
+            'nn_opt_state': self.nn.opt_state,
+        }
+        with open(path, 'wb') as f:
+            pickle.dump(data, f)
+        if self.hparams.verbose:
+            print(f'[{self.name}] Model saved to {path}')
+
+    def load_model(self, path):
+        """Load network weights from a pickle file."""
+        import pickle
+        with open(path, 'rb') as f:
+            data = pickle.load(f)
+        self.nn.params = data['nn_params']
+        self.nn.opt_state = data['nn_opt_state']
+        if self.hparams.verbose:
+            print(f'[{self.name}] Model loaded from {path}')
+
+    # ------------------------------------------------------------------
+    # Compatibility Stubs (online interface, unused in offline mode)
+    # ------------------------------------------------------------------
+
+    def update_buffer(self, contexts, actions, rewards):
+        self.data.add(contexts, actions.reshape(-1, 1), rewards.reshape(-1, 1))
+
+    def update(self, contexts, actions, rewards):
+        pass
+
+    def monitor(self, contexts=None, actions=None, rewards=None):
+        if contexts is not None and actions is not None and rewards is not None:
+            f = self.nn.out(self.nn.params, contexts, actions.ravel()).ravel()
+            mse = float(jnp.mean(jnp.square(f - rewards.ravel())))
+            print(f'[{self.name}] MSE={mse:.4f}')
+        else:
+            print(f'[{self.name}] Model ready.')
+
+
+class OfflineBatchNeuraLCB(BanditAlgorithm):
+    """Standard Offline Batch NeuraLCB with Reward Clipping.
+    
+    This algorithm is the standard NeuraLCB baseline but adapted for the pure offline
+    batch regime. It uses standard confidence bounds (no risk measures for action selection),
+    but includes reward clipping to avoid long-tail gradient collapse, and evaluates
+    risk metrics to allow fair comparison against RobustOfflineBatchNeuraLCB.
+    """
+
+    def __init__(self, hparams, update_freq=1, name='OfflineBatchNeuraLCB'):
+        self.name = name
+        self.hparams = hparams
+        self.update_freq = update_freq
+
+        opt = optax.adam(hparams.lr)
+        self.nn = NeuralBanditModelV2(opt, hparams, '{}-net'.format(name))
+        
+        self.data = BanditDataset(
+            hparams.context_dim,
+            hparams.num_actions,
+            hparams.buffer_s,
+            '{}-data'.format(name),
+        )
+
+        self.historical_residuals = None  # shape (N,)
+        self.rho_residuals = None         # scalar
+        self.Z_inv = None                 # shape (p, p)
+
+    def _compute_risk_functional(self, Y, axis=-1):
+        """Computes the requested risk measure on the sample distribution Y.
+        (Used purely for evaluation/comparison)."""
+        measure = getattr(self.hparams, 'risk_measure', 'cvar')
+        
+        if measure == 'mean':
+            return jnp.mean(Y, axis=axis)
+        elif measure == 'cvar':
+            alpha = self.hparams.alpha
+            N = Y.shape[axis]
+            k = jnp.maximum(1, int(alpha * N))
+            Y_sorted = jnp.sort(Y, axis=axis)
+            if axis == -1 or axis == 1:
+                return jnp.mean(Y_sorted[:, :k], axis=axis)
+            else:
+                return jnp.mean(Y_sorted[:k], axis=axis)
+        elif measure == 'entropic':
+            theta = getattr(self.hparams, 'entropic_theta', 1.0)
+            N = Y.shape[axis]
+            lse = jax.scipy.special.logsumexp(-theta * Y, axis=axis)
+            return -(1.0 / theta) * (lse - jnp.log(N))
+        elif measure == 'mean_variance':
+            lam = getattr(self.hparams, 'variance_lambda', 0.1)
+            return jnp.mean(Y, axis=axis) - lam * jnp.var(Y, axis=axis)
+        else:
+            raise ValueError(f"Unknown risk_measure: {measure}")
+
+    def reset(self, seed):
+        self.nn.reset(seed)
+        self.data.reset()
+        self.historical_residuals = None
+        self.Z_inv = None
+
+    def train_offline_batch(self, contexts, actions, rewards):
+        """Train the network on the full offline dataset and compute Z_inv."""
+        tau_n = self.hparams.tau_n
+        truncation_mode = getattr(self.hparams, 'truncation_mode', 'clip')
+
+        if truncation_mode == 'clip':
+            # r_tilde = r * I(|r| <= tau) + tau * sgn(r) * I(|r| > tau)
+            r_tilde = jnp.where(
+                jnp.abs(rewards) <= tau_n,
+                rewards,
+                tau_n * jnp.sign(rewards)
+            )
+            train_ctx, train_act, train_rew = contexts, actions, r_tilde
+        elif truncation_mode == 'mask':
+            mask = (jnp.abs(rewards) <= tau_n).ravel()
+            train_ctx, train_act, train_rew = contexts[mask], actions[mask], rewards[mask]
+        else:
+            train_ctx, train_act, train_rew = contexts, actions, rewards
+
+        self.data.reset()
+        self.data.add(train_ctx, train_act.reshape(-1, 1), train_rew.reshape(-1, 1))
+        self.nn.train(self.data, self.hparams.num_steps)
+
+        # Residuals are calculated using RAW rewards to preserve heavy-tail info for risk evaluation.
+        f_hist = self.nn.out(self.nn.params, contexts, actions).ravel()
+        self.historical_residuals = rewards.ravel() - f_hist
+
+        p = self.nn.num_params
+        Z = self.hparams.lambd0 * jnp.eye(p)
+        
+        num_train = contexts.shape[0]
+        z_chunk_size = getattr(self.hparams, 'chunk_size', 500)
+        
+        if self.hparams.verbose:
+            print(f'[{self.name}] Computing Z matrix in chunks (p={p})...')
+            pbar = tqdm(total=num_train, desc="Computing Z Matrix", unit="samples")
+
+        for i in range(0, num_train, z_chunk_size):
+            end_idx = min(i + z_chunk_size, num_train)
+            g_chunk = self.nn.grad_out(self.nn.params, contexts[i:end_idx], actions[i:end_idx]) / jnp.sqrt(self.nn.m)
+            Z = Z + g_chunk.T @ g_chunk
+            del g_chunk
+            if self.hparams.verbose:
+                pbar.update(end_idx - i)
+
+        if self.hparams.verbose:
+            pbar.close()
+
+        self.Z_inv = jnp.linalg.inv(Z)
+        del Z
+
+        # Evaluate risk functional of residuals purely for offline evaluation compatibility
+        self.rho_residuals = self._compute_risk_functional(self.historical_residuals, axis=0)
+
+        if self.hparams.verbose:
+            print(f'[{self.name}] Batch Training: mean |resid|={jnp.mean(jnp.abs(self.historical_residuals)):.4f} | rho(resid)={self.rho_residuals:.4f}')
+
+    def sample_action(self, contexts):
+        """Chooses actions using standard Lower Confidence Bounds (No Risk Functional)."""
+        assert self.historical_residuals is not None, "Call train_offline_batch() first."
+        assert self.Z_inv is not None, "Call train_offline_batch() first."
+
+        num_contexts = contexts.shape[0]
+        chunk_size = getattr(self.hparams, 'chunk_size', 500)
+        all_actions = []
+
+        if self.hparams.verbose:
+            pbar = tqdm(total=num_contexts, desc=f"Evaluating actions (chunk_size={chunk_size})", unit="samples")
+
+        for i in range(0, num_contexts, chunk_size):
+            batch_contexts = contexts[i : i + chunk_size]
+            B = batch_contexts.shape[0]
+            lcbs = []
+            
+            for a in range(self.hparams.num_actions):
+                actions_tmp = jnp.ones(shape=(B,)) * a
+                mu_a = self.nn.out(self.nn.params, batch_contexts, actions_tmp).ravel()
+
+                g_test = self.nn.grad_out(self.nn.params, batch_contexts, actions_tmp) / jnp.sqrt(self.nn.m)
+                R_a = jnp.sqrt(jnp.sum((g_test @ self.Z_inv) * g_test, axis=-1))
+
+                # Standard pessimism, no Lipschitz scaling or risk shifting
+                lcbs.append((mu_a - self.hparams.beta * R_a).reshape(-1, 1))
+
+            batch_LCBs = jnp.hstack(lcbs)
+            all_actions.append(jnp.argmax(batch_LCBs, axis=1))
+            
+            if self.hparams.verbose:
+                pbar.update(B)
+
+        if self.hparams.verbose:
+            pbar.close()
+
+        return jnp.concatenate(all_actions, axis=0)
+
+    def evaluate_offline_policy(self, contexts, pi_actions):
+        """Evaluates the Global Marginal Risk of a specified policy."""
+        assert self.historical_residuals is not None, "Call train_offline_batch() first."
+        
+        # 1. Marginal Return Distribution
+        mu = self.nn.out(self.nn.params, contexts, pi_actions).ravel()
+        # Risk evaluated exactly like RobustOfflineBatchNeuraLCB to allow fair comparison
+        marginal_risk = jnp.mean(mu) + self.rho_residuals
+        
+        # 2. Uncertainty Penalty
+        g_test = self.nn.grad_out(self.nn.params, contexts, pi_actions) / jnp.sqrt(self.nn.m)
+        pointwise_R = jnp.sqrt(jnp.sum((g_test @ self.Z_inv) * g_test, axis=-1))
+        
+        mean_R_pi = jnp.mean(pointwise_R)
+        lcb_marginal = marginal_risk - self.hparams.beta * mean_R_pi
+        
+        return {
+            "marginal_risk": marginal_risk,
+            "mean_R_pi": mean_R_pi,
+            "lcb_marginal": lcb_marginal,
+            "pointwise_R": pointwise_R
+        }
+
+    def save_model(self, path):
+        import pickle
+        data = {
+            'nn_params': self.nn.params,
+            'nn_opt_state': self.nn.opt_state,
+        }
+        with open(path, 'wb') as f:
+            pickle.dump(data, f)
+        if self.hparams.verbose:
+            print(f'[{self.name}] Model saved to {path}')
+
+    def load_model(self, path):
+        import pickle
+        with open(path, 'rb') as f:
+            data = pickle.load(f)
+        self.nn.params = data['nn_params']
+        self.nn.opt_state = data['nn_opt_state']
+        if self.hparams.verbose:
+            print(f'[{self.name}] Model loaded from {path}')
+
+    def update_buffer(self, contexts, actions, rewards):
+        self.data.add(contexts, actions.reshape(-1, 1), rewards.reshape(-1, 1))
+
+    def update(self, contexts, actions, rewards):
+        pass
+
+    def monitor(self, contexts=None, actions=None, rewards=None):
+        if contexts is not None and actions is not None and rewards is not None:
+            f = self.nn.out(self.nn.params, contexts, actions.ravel()).ravel()
+            mse = float(jnp.mean(jnp.square(f - rewards.ravel())))
+            print(f'[{self.name}] MSE={mse:.4f}')
+        else:
+            print(f'[{self.name}] Model ready.')
+
+
+class RiskExactNeuraLCBV2(ExactNeuraLCBV2):
+    """
+    Upgraded ExactNeuraLCBV2 with Tofu Loss (reward clipping) and Risk-Aware Action Selection.
+    This exactly implements the formula: argmax { rho(F) - L * R(pi) }
+    """
+    def __init__(self, hparams, update_freq=1, name='RiskExactNeuraLCBV2'):
+        super().__init__(hparams, update_freq, name)
+        self.historical_residuals = None
+        self.rho_residuals = None
+
+    def _compute_risk_functional(self, Y):
+        measure = getattr(self.hparams, 'risk_measure', 'cvar')
+        if measure == 'mean':
+            return jnp.mean(Y)
+        elif measure == 'cvar':
+            alpha = self.hparams.alpha
+            N = len(Y)
+            k = jnp.maximum(1, int(alpha * N))
+            Y_sorted = jnp.sort(Y)
+            return jnp.mean(Y_sorted[:k])
+        return jnp.mean(Y)
+
+    def _get_risk_lipschitz_factor(self):
+        measure = getattr(self.hparams, 'risk_measure', 'cvar')
+        if measure == 'cvar':
+            tail_prob = self.hparams.alpha if self.hparams.alpha < 0.5 else (1.0 - self.hparams.alpha)
+            return 1.0 / tail_prob
+        return 1.0
+
+    def update(self, contexts, actions, rewards):
+        # 1. Tofu Loss: Clip rewards to tau_n to avoid outlier gradient explosions
+        tau_n = getattr(self.hparams, 'tau_n', 1e6)
+        r_tilde = jnp.where(jnp.abs(rewards) <= tau_n, rewards, tau_n * jnp.sign(rewards))
+
+        self.data.add(contexts, actions, r_tilde)
+        self.nn.train(self.data, self.hparams.num_steps)
+
+        # 2. Risk Estimation: Calculate empirical residuals on RAW rewards
+        f_hist = self.nn.out(self.nn.params, contexts, actions).ravel()
+        self.historical_residuals = rewards.ravel() - f_hist
+        self.rho_residuals = self._compute_risk_functional(self.historical_residuals)
+
+        # 3. Update Confidence Matrix (Lambda_inv)
+        u = self.nn.grad_out(self.nn.params, contexts, actions) / jnp.sqrt(self.nn.m)
+        for i in range(contexts.shape[0]):
+            self.Lambda_inv = self.Lambda_inv.at[actions[i]].set(
+                inv_sherman_morrison_single_sample(u[i,:], self.Lambda_inv[actions[i],:,:])
+            )
+
+    def sample_action(self, contexts):
+        assert self.rho_residuals is not None, "Call update() first."
+        cs = getattr(self.hparams, 'chunk_size', 500)
+        num_chunks = math.ceil(contexts.shape[0] / cs)
+        acts = []
+        L_rho = self._get_risk_lipschitz_factor()
+
+        for i in range(num_chunks):
+            ctxs = contexts[i * cs: (i+1) * cs,:] 
+            lcb = []
+            for a in range(self.hparams.num_actions):
+                actions_tmp = jnp.ones(shape=(ctxs.shape[0],)) * a 
+
+                f = self.nn.out(self.nn.params, ctxs, actions_tmp) 
+                g = self.nn.grad_out(self.nn.params, ctxs, actions_tmp) / jnp.sqrt(self.nn.m)
+                gA = g @ self.Lambda_inv[a,:,:] 
+                
+                gAg = jnp.sum(jnp.multiply(gA, g), axis=-1) 
+                cnf = jnp.sqrt(gAg) 
+
+                # ========================================================
+                # TRANSITION FROM MEAN TO RISK-AWARE: rho(F) - L * R(pi)
+                # ========================================================
+                # 1. Calculate risk of the predicted distribution (Translation Invariance)
+                risk_a = f.ravel() + self.rho_residuals
+                
+                # 2. Calculate scaled uncertainty penalty (Lipschitz bounded)
+                penalty = self.hparams.beta * L_rho * cnf.ravel()
+                
+                # 3. Final Risk-Aware LCB
+                lcb_a = risk_a - penalty
+                lcb.append(lcb_a.reshape(-1,1)) 
+                
+            lcb = jnp.hstack(lcb) 
+            acts.append(jnp.argmax(lcb, axis=1)) 
+        return jnp.hstack(acts)
+
+    def sample_action_milp(self, contexts, noise_samples=None):
+        """Chooses actions by globally maximizing Marginal CVaR using MILP.
+        
+        Unlike `sample_action` which optimizes conditional point-wise CVaR, 
+        this computes the global optimal policy coupling all contexts together.
+        """
+        import gurobipy as gp
+        from gurobipy import GRB
+        import numpy as np
+        
+        assert self.rho_residuals is not None, "Call update() first."
+        
+        if noise_samples is None:
+            noise_samples = np.array(self.historical_residuals)
+            
+        I = contexts.shape[0]
+        J = self.hparams.num_actions
+        M = len(noise_samples)
+        
+        if getattr(self.hparams, 'verbose', False):
+            print(f'[{self.name}] Extracting mu and R matrices for MILP (I={I}, J={J}, M={M})...')
+            
+        mu_matrix = np.zeros((I, J))
+        R_matrix = np.zeros((I, J))
+        L_rho = self._get_risk_lipschitz_factor()
+        chunk_size = getattr(self.hparams, 'chunk_size', 500)
+        
+        for a in range(J):
+            mu_a_full = []
+            R_a_full = []
+            for i in range(0, I, chunk_size):
+                batch_contexts = contexts[i : i + chunk_size]
+                B = batch_contexts.shape[0]
+                actions_tmp = jnp.ones(shape=(B,)) * a
+                
+                # Mean Prediction
+                mu_a = self.nn.out(self.nn.params, batch_contexts, actions_tmp).ravel()
+                
+                # Uncertainty with Action-Specific Lambda_inv
+                g = self.nn.grad_out(self.nn.params, batch_contexts, actions_tmp) / jnp.sqrt(self.nn.m)
+                gA = g @ self.Lambda_inv[a, :, :] 
+                gAg = jnp.sum(jnp.multiply(gA, g), axis=-1) 
+                R_a = jnp.sqrt(gAg)
+                
+                mu_a_full.append(np.array(mu_a))
+                R_a_full.append(np.array(R_a))
+                
+            mu_matrix[:, a] = np.concatenate(mu_a_full)
+            R_matrix[:, a] = np.concatenate(R_a_full)
+            
+        if getattr(self.hparams, 'verbose', False):
+            print(f'[{self.name}] Solving Exact Marginal CVaR LCB MILP...')
+            
+        env = gp.Env(empty=True)
+        env.setParam("OutputFlag", 1 if getattr(self.hparams, 'verbose', False) else 0)
+        env.start()
+        model = gp.Model("RiskExact_CVaR_LCB_MILP", env=env)
+        
+        z = model.addVars(I, J, vtype=GRB.BINARY, name="z")
+        q = model.addVar(vtype=GRB.CONTINUOUS, lb=-GRB.INFINITY, name="q")
+        s = model.addVars(I, M, vtype=GRB.CONTINUOUS, lb=0.0, name="s")
+        
+        alpha = getattr(self.hparams, 'alpha', 0.9)
+        tail_prob = alpha if alpha < 0.5 else (1.0 - alpha)
+        beta = self.hparams.beta
+        
+        cvar_expr = q - (1.0 / (I * M * tail_prob)) * gp.quicksum(s[i, m] for i in range(I) for m in range(M))
+        penalty_expr = (beta * L_rho / float(I)) * gp.quicksum(R_matrix[i, j] * z[i, j] for i in range(I) for j in range(J))
+        
+        model.setObjective(cvar_expr - penalty_expr, GRB.MAXIMIZE)
+        
+        for i in range(I):
+            model.addConstr(gp.quicksum(z[i, j] for j in range(J)) == 1)
+            
+        for i in range(I):
+            for m in range(M):
+                mu_z_sum = gp.quicksum(mu_matrix[i, j] * z[i, j] for j in range(J))
+                model.addConstr(s[i, m] >= q - (mu_z_sum + noise_samples[m]))
+                
+        model.optimize()
+        
+        if model.status == GRB.OPTIMAL:
+            optimal_policy = np.zeros(I, dtype=int)
+            for i in range(I):
+                for j in range(J):
+                    if z[i, j].X > 0.5:
+                        optimal_policy[i] = j
+                        break
+            if getattr(self.hparams, 'verbose', False):
+                print(f'[{self.name}] MILP solved. Max CVaR LCB = {model.ObjVal:.4f}')
+            return jnp.array(optimal_policy)
+        else:
+            print(f'[{self.name}] MILP failed. Fallback to point-wise LCB.')
+            return self.sample_action(contexts)
