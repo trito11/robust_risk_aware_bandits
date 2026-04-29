@@ -32,6 +32,44 @@ def compute_gt_marginal_cvar(test_mean, actions, true_noise, alpha):
     tail_prob = alpha if alpha < 0.5 else (1.0 - alpha)
     k = max(1, int(tail_prob * len(sorted_vals)))
     return np.mean(sorted_vals[:k])
+import gurobipy as gp
+from gurobipy import GRB
+
+def get_oracle_optimal_actions(test_mean, true_noise, alpha):
+    I, K = test_mean.shape
+    M = len(true_noise)
+    
+    env = gp.Env(empty=True)
+    env.setParam('OutputFlag', 0)
+    env.start()
+    model = gp.Model("Oracle_CVaR_MILP", env=env)
+    
+    # Khai báo biến
+    x = model.addMVar((I, K), vtype=GRB.BINARY, name="x")
+    var_nu = model.addVar(lb=-GRB.INFINITY, name="nu")
+    z = model.addMVar((I, M), lb=0.0, name="z")
+    
+    # Ràng buộc: Mỗi context chọn đúng 1 action
+    model.addConstr(x.sum(axis=1) == 1, name="OneAction")
+    
+    # Ràng buộc tính CVaR trên giá trị THẬT (test_mean + true_noise)
+    for i in range(I):
+        for m in range(M):
+            # Chọn test_mean[i, k] thật sự
+            chosen_mean = gp.quicksum(x[i, k] * test_mean[i, k] for k in range(K))
+            actual_reward = chosen_mean + true_noise[m]
+            model.addConstr(z[i, m] >= var_nu - actual_reward)
+            
+    # Hàm mục tiêu: Maximize CVaR
+    tail_prob = alpha if alpha < 0.5 else (1.0 - alpha)
+    cvar_expr = var_nu - (1.0 / (tail_prob * I * M)) * z.sum()
+    model.setObjective(cvar_expr, GRB.MAXIMIZE)
+    
+    model.optimize()
+    
+    if model.Status == GRB.OPTIMAL:
+        return np.argmax(x.X, axis=1)
+    return np.zeros(I, dtype=int)
 
 def main(_):
     hparams = HParams(
@@ -85,7 +123,7 @@ def main(_):
     test_mean = test_mean[:FLAGS.num_test]
     
     # Sinh mẫu nhiễu thật (M = 100)
-    M_samples = 100
+    M_samples = 500
     true_noise = data.generate_noise((M_samples,))
 
     print("\n4. Action Selection: LOCAL (Point-wise argmax)")
@@ -121,6 +159,17 @@ def main(_):
         print("\n=> KẾT LUẬN: Hai thuật toán cho ra Marginal CVaR tương đương nhau (MILP xác nhận Argmax đã tối ưu).")
     else:
         print("\n=> KẾT LUẬN: Point-wise ngẫu nhiên cho kết quả nhỉnh hơn (Hãy thử tăng số lượng Contexts hoặc điều chỉnh Beta).")
+    # Tính Oracle Optimal Policy
+    oracle_actions = get_oracle_optimal_actions(test_mean, true_noise, FLAGS.alpha)
+    opt_cvar = compute_gt_marginal_cvar(test_mean, oracle_actions, true_noise, FLAGS.alpha)
+
+    # Tính Suboptimality
+    local_subopt = opt_cvar - local_cvar
+    global_subopt = opt_cvar - global_cvar
+
+    print(f"-> Oracle Optimal GT CVaR  : {opt_cvar:.4f}")
+    print(f"   => Local Suboptimality  : {local_subopt:.4f}")
+    print(f"   => Global Suboptimality : {global_subopt:.4f}")
 
 if __name__ == '__main__':
     app.run(main)
