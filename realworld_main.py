@@ -226,8 +226,8 @@ def main(unused_argv):
             NeuralRegressionOffline(hparams),
             RobustOfflineBatchNeuraLCB(hparams),
         ]
-        algo_prefix = 'neural_regression_{}_risk={}_tau={}_beta={}_n={}_layers={}'.format(
-            FLAGS.data_type, FLAGS.risk_measure, FLAGS.tau_n, FLAGS.beta, FLAGS.num_contexts, layer_str
+        algo_prefix = 'neural_regression_{}_agent={}_oracle={}_risk={}_alpha={}_beta={}_n={}_layers={}'.format(
+            FLAGS.data_type, eval_m, oracle_m, FLAGS.risk_measure, FLAGS.alpha, FLAGS.beta, FLAGS.num_contexts, layer_str
         )
 
     if FLAGS.algo_group == 'risk-exact':
