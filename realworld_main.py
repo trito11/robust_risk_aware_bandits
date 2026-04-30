@@ -281,6 +281,9 @@ def main(unused_argv):
         all_gt_means  = [[] for _ in range(num_algos)]
         all_gt_vars   = [[] for _ in range(num_algos)]
         all_times        = [[] for _ in range(num_algos)]
+        all_oracle_cvars = []
+        all_oracle_means = []
+        all_oracle_vars  = []
         
         # --- Pre-calculate Oracle once for all simulations ---
         # Get test set and true means (fixed seed inside reset_data for test set)
