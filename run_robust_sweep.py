@@ -16,12 +16,13 @@ NUM_SIM = 10      # 500 runs to get stable statistics for the plot
 NUM_STEPS = 1000
 NUM_TEST = 50     # Number of test contexts (keep small for MILP)
 
-# Options added: ALGO_GROUP and POLICY_EVAL_METHOD
-ALGO_GROUP = "risk-exact" # "robust-offline", "approx-neural", "baseline", "risk-exact"
-POLICY_EVAL_METHOD = "local"  # "local" (point-wise argmax) or "global" (MILP)
+# Options added: ALGO_GROUP, AGENT_EVAL_METHOD, ORACLE_EVAL_METHOD
+ALGO_GROUP = "quantile-risk" # "robust-offline", "neural-regression", "risk-exact", "quantile-risk"
+AGENT_EVAL_METHOD = "local"   # "local" (point-wise argmax) or "global" (MILP)
+ORACLE_EVAL_METHOD = "global" # "local" or "global" (Marginal CVaR via MILP)
 
 # 2. Sweep over num_contexts (N)
-N_VALUES = [100,200]
+N_VALUES = [100, 500, 1000, 2000, 5000]
 
 for n in N_VALUES:
     print(f"\n" + "="*60)
@@ -37,23 +38,20 @@ for n in N_VALUES:
         "--num_actions", str(NUM_ACTIONS),
         "--num_contexts", str(n),
         "--num_test_contexts", str(NUM_TEST),
-        "--layer_sizes", LAYER_SIZES,
+        "--num_sim", str(NUM_SIM),
         "--beta", str(BETA),
-        "--algo_group", ALGO_GROUP,
-        "--policy_eval_method", POLICY_EVAL_METHOD,
         "--risk_measure", RISK_MEASURE,
         "--alpha", str(ALPHA),
         "--tau_n", str(TAU_N),
-        "--num_sim", str(NUM_SIM),
+        "--layer_sizes", LAYER_SIZES,
         "--num_steps", str(NUM_STEPS),
+        "--algo_group", ALGO_GROUP,
+        "--agent_eval_method", AGENT_EVAL_METHOD,
+        "--oracle_eval_method", ORACLE_EVAL_METHOD,
         "--nouse_wandb"
     ]
     
-    # Execute the experiment
-    process = subprocess.run(cmd)
-    
-    if process.returncode != 0:
-        print(f"ERROR: Experiment failed for N={n}. Stopping sweep.")
-        break
+    print(f"Executing: {' '.join(cmd)}")
+    subprocess.run(cmd)
 
 print("\nSweep completed! You can now use the notebook to plot the results.")

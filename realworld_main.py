@@ -84,7 +84,8 @@ flags.DEFINE_string('wandb_project', 'offline_neural_bandits', 'wandb project na
 flags.DEFINE_string('wandb_entity', None, 'wandb entity')
 
 # Evaluation
-flags.DEFINE_string('policy_eval_method', 'local', 'How to select actions on test set: local (argmax) or global (milp)')
+flags.DEFINE_string('agent_eval_method', 'local', 'How agent selects actions: local (argmax) or global (milp)')
+flags.DEFINE_string('oracle_eval_method', 'global', 'How oracle selects actions: local (argmax) or global (milp)')
 
 #================================================================
 # Network parameters
@@ -296,24 +297,37 @@ def main(unused_argv):
                 beh_rewards = rewards
 
             opt_actions = np.argmax(test_mean, axis=1)
-            opt_vals = test_mean[np.arange(test_mean.shape[0]), opt_actions.ravel()]
-
             # Oracle noise (computed once per sim)
             if FLAGS.data_type == 'robust_syn':
-                oracle_noise = data.generate_noise(opt_vals.shape)
-                oracle_noisy_r = opt_vals + oracle_noise
-            elif FLAGS.data_type == 'simglucose':
-                oracle_noisy_r = opt_vals
-            else:
-                oracle_noisy_r = None
-
-            if oracle_noisy_r is not None:
+                oracle_noise = data.generate_noise(test_mean.shape[0])
+                # Determine Oracle CVaR based on oracle_eval_method
+                if FLAGS.oracle_eval_method == 'global':
+                    oracle_actions = data.get_oracle_optimal_actions_milp(test_ctx, FLAGS.alpha, noise_samples=oracle_noise)
+                else:
+                    oracle_actions = data.get_oracle_optimal_actions(test_ctx, oracle_noise, FLAGS.alpha)
+                
+                opt_vals = test_mean[np.arange(test_mean.shape[0]), oracle_actions.ravel()]
+                opt_actions = oracle_actions
+                
+                # Calculate Oracle Ground Truth Stats
+                # Marginal CVaR for Oracle
+                I_test = test_ctx.shape[0]
+                M_noise = oracle_noise.shape[0]
+                # Repeat means to match noise samples for marginal evaluation
+                expanded_opt_vals = np.repeat(opt_vals, M_noise)
+                expanded_noise = np.tile(oracle_noise, I_test)
+                oracle_noisy_r = expanded_opt_vals + expanded_noise
+                
                 oracle_mean = np.mean(oracle_noisy_r)
                 oracle_var  = np.var(oracle_noisy_r)
-                sorted_oracle = np.sort(oracle_noisy_r)
-                oracle_cvar = np.mean(sorted_oracle[:int(FLAGS.alpha * len(sorted_oracle))])
+                sorted_o = np.sort(oracle_noisy_r)
+                oracle_cvar = np.mean(sorted_o[:int(max(1, FLAGS.alpha * len(sorted_o)))])
             else:
-                oracle_mean = oracle_var = oracle_cvar = 0.0
+                oracle_actions = np.argmax(test_mean, axis=1)
+                opt_vals = test_mean[np.arange(test_mean.shape[0]), oracle_actions.ravel()]
+                oracle_mean = np.mean(opt_vals)
+                oracle_var  = np.var(opt_vals)
+                oracle_cvar = 0.0 # Cannot compute CVaR without noise samples
 
             all_oracle_means.append(oracle_mean)
             all_oracle_vars.append(oracle_var)
@@ -325,9 +339,8 @@ def main(unused_argv):
                 algo.reset(sim * 1111)
                 algo.train_offline_batch(contexts, actions, beh_rewards)
 
-                if FLAGS.policy_eval_method == 'global' and hasattr(algo, 'sample_action_milp'):
+                if FLAGS.agent_eval_method == 'global' and hasattr(algo, 'sample_action_milp'):
                     if oracle_noise is None:
-                        # Fallback for datasets without synthetic true noise
                         eval_noise = np.random.standard_t(df=2.1, size=(100,))
                     else:
                         eval_noise = oracle_noise
@@ -339,10 +352,14 @@ def main(unused_argv):
                 regret = np.mean(opt_vals - sel_vals)
                 acc    = np.mean(test_actions.ravel() == opt_actions.ravel())
 
-                # Ground-truth risk stats
-                if FLAGS.data_type == 'robust_syn':
-                    fresh_noise   = data.generate_noise(sel_vals.shape)
-                    agent_noisy_r = sel_vals + fresh_noise
+                # Ground-truth risk stats (Calculated Marginally for accuracy)
+                if FLAGS.data_type == 'robust_syn' and oracle_noise is not None:
+                    # Marginal Agent Evaluation: Union of samples across all contexts
+                    I_test = test_ctx.shape[0]
+                    M_noise = oracle_noise.shape[0]
+                    expanded_sel_vals = np.repeat(sel_vals, M_noise)
+                    expanded_noise = np.tile(oracle_noise, I_test)
+                    agent_noisy_r = expanded_sel_vals + expanded_noise
                 elif FLAGS.data_type == 'simglucose':
                     agent_noisy_r = sel_vals
                 else:
@@ -352,6 +369,7 @@ def main(unused_argv):
                     gt_mean = np.mean(agent_noisy_r)
                     gt_var  = np.var(agent_noisy_r)
                     sorted_agent = np.sort(agent_noisy_r)
+                    # Marginal CVaR
                     gt_cvar = np.mean(sorted_agent[:int(FLAGS.alpha * len(sorted_agent))])
                 else:
                     gt_mean = gt_var = gt_cvar = 0.0

@@ -1544,8 +1544,18 @@ class PolicyManager:
         
     def update_Z_inv(self, phi):
         """Efficient Z_inv update using Sherman-Morrison formula."""
-        # Use existing utility function
         self.Z_inv = inv_sherman_morrison_single_sample(phi, self.Z_inv)
+
+    @staticmethod
+    @jax.jit
+    def batch_update_Z_inv(phi_batch, initial_Z_inv):
+        """Vectorized batch update of Z_inv on GPU using jax.lax.scan."""
+        def scan_fn(Z_inv_acc, phi_single):
+            new_Z_inv = inv_sherman_morrison_single_sample(phi_single, Z_inv_acc)
+            return new_Z_inv, None
+        
+        final_Z_inv, _ = jax.lax.scan(scan_fn, initial_Z_inv, phi_batch)
+        return final_Z_inv
         
     def get_uncertainty(self, phi):
         """Calculates Mahalanobis uncertainty: sqrt(phi^T Z^-1 phi)."""
@@ -1621,11 +1631,8 @@ class QuantileRiskNeuralBandit(BanditAlgorithm):
             
             phi, _ = self.critic.get_phi_and_quantiles(self.nn_model.params, ctx_batch, act_batch)
             
-            # Incremental updates for Z_inv
-            # We can use jax.vmap or a simple loop. Loop is safer for memory with Sherman-Morrison.
-            phi_np = np.array(phi)
-            for j in range(phi_np.shape[0]):
-                self.policy_manager.update_Z_inv(phi_np[j])
+            # Vectorized incremental updates for Z_inv on GPU
+            self.policy_manager.Z_inv = self.policy_manager.batch_update_Z_inv(phi, self.policy_manager.Z_inv)
                 
             if getattr(self.hparams, 'verbose', False):
                 pbar.update(end - i)
