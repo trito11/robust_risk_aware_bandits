@@ -1448,10 +1448,18 @@ class RiskExactNeuraLCBV2(ExactNeuraLCBV2):
                 # Mean Prediction
                 mu_a = self.nn.out(self.nn.params, batch_contexts, actions_tmp).ravel()
                 
-                # Uncertainty with Action-Specific Lambda_inv
+                # Uncertainty
                 g = self.nn.grad_out(self.nn.params, batch_contexts, actions_tmp) / jnp.sqrt(self.nn.m)
-                gA = g @ self.Lambda_inv[a, :, :] 
-                gAg = jnp.sum(jnp.multiply(gA, g), axis=-1) 
+                
+                if hasattr(self, 'Lambda_inv'):
+                    # Approx version (Action-specific)
+                    gA = g @ self.Lambda_inv[a, :, :] 
+                    gAg = jnp.sum(jnp.multiply(gA, g), axis=-1) 
+                else:
+                    # Exact version (Shared Z_inv)
+                    gA = g @ self.Z_inv
+                    gAg = jnp.sum(jnp.multiply(gA, g), axis=-1)
+                
                 R_a = jnp.sqrt(gAg)
                 
                 mu_a_full.append(np.array(mu_a))
