@@ -7,16 +7,21 @@ FUNCTION_TYPE = "cosine"
 NOISE_TYPE = "student-t"
 CONTEXT_DIM = 20
 NUM_ACTIONS = 30
-LAYER_SIZES = "32,32"
+LAYER_SIZES = "10"
 BETA = 0.1
 RISK_MEASURE = "cvar"
 ALPHA = 0.05
 TAU_N = 1.0
-NUM_SIM = 500      # 500 runs to get stable statistics for the plot
+NUM_SIM = 10      # 500 runs to get stable statistics for the plot
 NUM_STEPS = 1000
+NUM_TEST = 50     # Number of test contexts (keep small for MILP)
+
+# Options added: ALGO_GROUP and POLICY_EVAL_METHOD
+ALGO_GROUP = "risk-exact" # "robust-offline", "approx-neural", "baseline", "risk-exact"
+POLICY_EVAL_METHOD = "local"  # "local" (point-wise argmax) or "global" (MILP)
 
 # 2. Sweep over num_contexts (N)
-N_VALUES = [1000, 2000, 3000, 5000, 10000, 15000, 20000]
+N_VALUES = [100,200]
 
 for n in N_VALUES:
     print(f"\n" + "="*60)
@@ -31,9 +36,11 @@ for n in N_VALUES:
         "--context_dim", str(CONTEXT_DIM),
         "--num_actions", str(NUM_ACTIONS),
         "--num_contexts", str(n),
+        "--num_test_contexts", str(NUM_TEST),
         "--layer_sizes", LAYER_SIZES,
         "--beta", str(BETA),
-        "--algo_group", "robust-offline",
+        "--algo_group", ALGO_GROUP,
+        "--policy_eval_method", POLICY_EVAL_METHOD,
         "--risk_measure", RISK_MEASURE,
         "--alpha", str(ALPHA),
         "--tau_n", str(TAU_N),

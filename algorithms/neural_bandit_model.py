@@ -328,3 +328,76 @@ class NeuralBanditModelV2(NeuralBanditModel):
             pbar.close()
         
         self.params, self.opt_state = params, opt_state
+
+
+class QuantileNeuralBanditModel(NeuralBanditModelV2):
+    """Neural Network model for Quantile Regression in Bandits."""
+
+    def __init__(self, optimizer, hparams, name='QuantileNeuralBanditModel'):
+        self.num_quantiles = getattr(hparams, 'num_quantiles', 20)
+        self.kappa = getattr(hparams, 'huber_kappa', 1.0)
+        super().__init__(optimizer, hparams, name)
+
+    def build_model(self):
+        """Transform impure functions into pure functions and apply JAX tranformations."""
+        self.nn = hk.without_apply_rng(hk.transform(self.net_impure_fn))
+        self.out = jax.jit(self.out_impure_fn)
+        # We need both quantiles and features
+        self.phi_and_out = jax.jit(hk.without_apply_rng(hk.transform(self.phi_and_out_impure_fn)).apply)
+        self.action_convolution = jax.jit(self.action_convolution_impure_fn)
+        self.loss = jax.jit(self.loss_impure_fn)
+        self.update = jax.jit(self.update_impure_fn)
+
+        # Initialize
+        self.init(self.hparams.seed)
+        self.num_params = sum(x.size for x in jax.tree_util.tree_leaves(self.params))
+
+    def net_impure_fn(self, contexts, actions):
+        """Returns only the quantiles."""
+        phi, quantiles = self.phi_and_out_impure_fn(contexts, actions)
+        return quantiles
+
+    def phi_and_out_impure_fn(self, contexts, actions):
+        """Returns both last layer features (phi) and quantiles."""
+        convoluted_contexts = self.action_convolution_impure_fn(contexts, actions)
+        
+        x = convoluted_contexts
+        for i, num_units in enumerate(self.hparams.layer_sizes):
+            x = hk.Linear(num_units, name=f"layer_{i}")(x)
+            if self.hparams.layer_n:
+                x = hk.LayerNorm(axis=1, create_scale=True, create_offset=True)(x)
+            x = self.hparams.activation(x)
+        
+        phi = x # Last hidden layer
+        quantiles = hk.Linear(self.num_quantiles, name="quantile_output")(phi)
+        return phi, quantiles
+
+    def loss_impure_fn(self, params, contexts, actions, rewards):
+        """Quantile Huber Loss."""
+        quantiles = self.out(params, contexts, actions) # (batch, num_quantiles)
+        rewards = rewards.reshape(-1, 1) # (batch, 1)
+        
+        diff = rewards - quantiles # (batch, num_quantiles)
+        abs_diff = jnp.abs(diff)
+        
+        # Huber Loss
+        huber_loss = jnp.where(abs_diff <= self.kappa, 
+                               0.5 * jnp.square(diff), 
+                               self.kappa * (abs_diff - 0.5 * self.kappa))
+        
+        # Quantile thresholds
+        tau = jnp.linspace(1.0 / (2.0 * self.num_quantiles), 
+                          1.0 - 1.0 / (2.0 * self.num_quantiles), 
+                          self.num_quantiles)
+        
+        # Quantile Huber Loss: |tau - I(diff < 0)| * huber_loss / kappa
+        weight = jnp.abs(tau - (diff < 0).astype(jnp.float32))
+        quantile_huber_loss = weight * huber_loss / self.kappa
+        
+        loss = jnp.mean(jnp.sum(quantile_huber_loss, axis=1))
+        
+        # L2 Regularization
+        reg_loss = 0.5 * self.hparams.lambd * sum(
+                jnp.sum(jnp.square(param)) for param in jax.tree_util.tree_leaves(params) 
+            )
+        return loss + reg_loss

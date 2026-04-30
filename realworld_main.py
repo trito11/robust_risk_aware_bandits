@@ -1,14 +1,19 @@
 """Mini main for testing algorithms. """ 
 
+import os 
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
+os.environ['XLA_PYTHON_CLIENT_PREALLOCATE'] = 'false'
+
 import numpy as np 
 import jax  
+from jax import config
+config.update("jax_debug_nans", False)
 import jax.numpy as jnp 
 from easydict import EasyDict as edict
-import os 
 import time 
 
 from core.contextual_bandit import contextual_bandit_runner
-from algorithms.neural_offline_bandit import ExactNeuraLCBV2, NeuralGreedyV2, ApproxNeuraLCBV2, RobustOfflineBatchNeuraLCB, NeuralRegressionOffline
+from algorithms.neural_offline_bandit import ExactNeuraLCBV2, NeuralGreedyV2, ApproxNeuraLCBV2, RobustOfflineBatchNeuraLCB, NeuralRegressionOffline, RiskExactNeuraLCBV2, QuantileRiskNeuralBandit
 from algorithms.lin_lcb import LinLCB 
 from algorithms.kern_lcb import KernLCB 
 from algorithms.uniform_sampling import UniformSampling
@@ -52,6 +57,10 @@ flags.DEFINE_bool('data_rand', True, 'Where randomly sample a data batch or  use
 
 flags.DEFINE_float('rbf_sigma', 1, 'RBF sigma for KernLCB') # [0.1, 1, 10]
 
+# Quantile Regression
+flags.DEFINE_integer('num_quantiles', 20, 'Number of quantiles for Quantile Regression')
+flags.DEFINE_float('huber_kappa', 1.0, 'Kappa parameter for Huber Loss')
+
 # NeuraLCB 
 flags.DEFINE_float('beta', 0.1, 'confidence paramter') # [0.01, 0.05, 0.1, 0.5, 1, 5, 10] 
 flags.DEFINE_float('lr', 1e-3, 'learning rate') 
@@ -73,6 +82,9 @@ flags.DEFINE_string('save_model_path', 'results/model.pkl', 'Path to save weight
 flags.DEFINE_boolean('use_wandb', False, 'Whether to use wandb for logging')
 flags.DEFINE_string('wandb_project', 'offline_neural_bandits', 'wandb project name')
 flags.DEFINE_string('wandb_entity', None, 'wandb entity')
+
+# Evaluation
+flags.DEFINE_string('policy_eval_method', 'local', 'How to select actions on test set: local (argmax) or global (milp)')
 
 #================================================================
 # Network parameters
@@ -215,6 +227,24 @@ def main(unused_argv):
             FLAGS.data_type, FLAGS.risk_measure, FLAGS.tau_n, FLAGS.beta, FLAGS.num_contexts, layer_str
         )
 
+    if FLAGS.algo_group == 'risk-exact':
+        algos = [
+            RiskExactNeuraLCBV2(hparams)
+        ]
+        layer_str = "-".join([str(s) for s in layer_sizes])
+        algo_prefix = 'risk_exact_{}_risk={}_beta={}_n={}_layers={}'.format(
+            FLAGS.data_type, FLAGS.risk_measure, FLAGS.beta, FLAGS.num_contexts, layer_str
+        )
+
+    if FLAGS.algo_group == 'quantile-risk':
+        algos = [
+            QuantileRiskNeuralBandit(hparams)
+        ]
+        layer_str = "-".join([str(s) for s in layer_sizes])
+        algo_prefix = 'quantile_risk_{}_alpha={}_beta={}_n={}_layers={}'.format(
+            FLAGS.data_type, FLAGS.alpha, FLAGS.beta, FLAGS.num_contexts, layer_str
+        )
+
     #==============================
     # W&B Init
     #==============================
@@ -294,7 +324,15 @@ def main(unused_argv):
                 algo.reset(sim * 1111)
                 algo.train_offline_batch(contexts, actions, beh_rewards)
 
-                test_actions = algo.sample_action(test_ctx)
+                if FLAGS.policy_eval_method == 'global' and hasattr(algo, 'sample_action_milp'):
+                    if oracle_noise is None:
+                        # Fallback for datasets without synthetic true noise
+                        eval_noise = np.random.standard_t(df=2.1, size=(100,))
+                    else:
+                        eval_noise = oracle_noise
+                    test_actions = algo.sample_action_milp(test_ctx, noise_samples=eval_noise)
+                else:
+                    test_actions = algo.sample_action(test_ctx)
                 sel_vals = test_mean[np.arange(test_mean.shape[0]), test_actions.ravel()]
 
                 regret = np.mean(opt_vals - sel_vals)
@@ -352,6 +390,8 @@ def main(unused_argv):
             save_dict[f"{safe}_gt_means"]= np.array(all_gt_means[ai],dtype=np.float32)
             save_dict[f"{safe}_gt_vars"] = np.array(all_gt_vars[ai], dtype=np.float32)
             save_dict[f"{safe}_times"]   = np.array(all_times[ai],   dtype=np.float32)
+            # Thêm lưu suboptimality
+            save_dict[f"{safe}_subopt"]  = np.array(all_oracle_cvars, dtype=np.float32) - np.array(all_gt_cvars[ai], dtype=np.float32)
         np.savez(file_name, **save_dict)
 
         # Backward-compat: also expose flat regrets/errs for the first algo

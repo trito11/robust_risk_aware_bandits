@@ -10,7 +10,7 @@ from joblib import Parallel, delayed
 from core.bandit_algorithm import BanditAlgorithm 
 from core.bandit_dataset import BanditDataset
 from core.utils import inv_sherman_morrison, inv_sherman_morrison_single_sample, vectorize_tree
-from algorithms.neural_bandit_model import NeuralBanditModel, NeuralBanditModelV2
+from algorithms.neural_bandit_model import NeuralBanditModel, NeuralBanditModelV2, QuantileNeuralBanditModel
 
 class ExactNeuraLCBV2(BanditAlgorithm):
     """NeuraLCB using exact confidence matrix and NeuralBanditModelV2. """
@@ -701,8 +701,12 @@ class RobustOfflineBatchNeuraLCB(BanditAlgorithm):
         if self.hparams.verbose:
             pbar.close()
 
-        self.Z_inv = jnp.linalg.inv(Z)
-        del Z # Free memory immediately after inversion
+        # Invert on CPU using numpy to prevent JAX OOM on large matrices (e.g. 20k x 20k)
+        Z_cpu = jax.device_get(Z)
+        import numpy as np
+        Z_inv_cpu = np.linalg.inv(Z_cpu)
+        self.Z_inv = jax.device_put(Z_inv_cpu)
+        del Z, Z_cpu, Z_inv_cpu # Free memory immediately after inversion
 
         # Step 5: Residual Risk for Translation Invariance
         # Use Translation Invariance Property: rho(mu + residual) = mu + rho(residual)
@@ -1499,4 +1503,221 @@ class RiskExactNeuraLCBV2(ExactNeuraLCBV2):
             return jnp.array(optimal_policy)
         else:
             print(f'[{self.name}] MILP failed. Fallback to point-wise LCB.')
+            return self.sample_action(contexts)
+
+
+class DistributionalCritic:
+    """Estimates conditional quantiles and computes risk metrics (CVaR)."""
+    def __init__(self, nn_model):
+        self.nn = nn_model
+        
+    def get_quantiles(self, params, contexts, actions):
+        return self.nn.out(params, contexts, actions)
+    
+    def get_phi_and_quantiles(self, params, contexts, actions):
+        return self.nn.phi_and_out(params, contexts, actions)
+    
+    def compute_cvar(self, quantiles, alpha):
+        """Computes Empirical CVaR as the average of the lowest k quantiles."""
+        # quantiles: (batch, num_quantiles)
+        N = quantiles.shape[1]
+        # CVaR is the average of the lowest (1-alpha) fraction of quantiles
+        # The prompt says k = N * (1-alpha)
+        tail_prob = alpha if alpha < 0.5 else (1.0 - alpha)
+        k = int(N * tail_prob)
+        if k < 1: k = 1
+        
+        sorted_quantiles = jnp.sort(quantiles, axis=1)
+        return jnp.mean(sorted_quantiles[:, :k], axis=1)
+
+
+class PolicyManager:
+    """Manages uncertainty estimation and action selection."""
+    def __init__(self, hparams, phi_dim):
+        self.hparams = hparams
+        self.phi_dim = phi_dim
+        self.Z_inv = jnp.eye(self.phi_dim) / hparams.lambd0
+        # Lipschitz constant for CVaR
+        alpha = getattr(hparams, 'alpha', 0.1)
+        tail_prob = alpha if alpha < 0.5 else (1.0 - alpha)
+        self.L = 1.0 / tail_prob
+        
+    def update_Z_inv(self, phi):
+        """Efficient Z_inv update using Sherman-Morrison formula."""
+        # Use existing utility function
+        self.Z_inv = inv_sherman_morrison_single_sample(phi, self.Z_inv)
+        
+    def get_uncertainty(self, phi):
+        """Calculates Mahalanobis uncertainty: sqrt(phi^T Z^-1 phi)."""
+        # phi: (batch, phi_dim)
+        u2 = jnp.sum((phi @ self.Z_inv) * phi, axis=1)
+        return jnp.sqrt(jnp.maximum(u2, 0.0))
+    
+    def select_action(self, contexts, critic, params):
+        """Policy selection rule: argmax { rho(G) - L * u(x, a) }."""
+        num_actions = self.hparams.num_actions
+        beta = self.hparams.beta
+        alpha = getattr(self.hparams, 'alpha', 0.1)
+        
+        all_scores = []
+        for a in range(num_actions):
+            actions = jnp.full((contexts.shape[0],), a)
+            phi, quantiles = critic.get_phi_and_quantiles(params, contexts, actions)
+            
+            rho = critic.compute_cvar(quantiles, alpha)
+            u = self.get_uncertainty(phi)
+            
+            score = rho - self.L * beta * u
+            all_scores.append(score)
+            
+        all_scores = jnp.stack(all_scores, axis=1) # (batch, num_actions)
+        return jnp.argmax(all_scores, axis=1)
+
+
+class QuantileRiskNeuralBandit(BanditAlgorithm):
+    """Implementation of Risk-Aware Neural Contextual Bandit (RANCB) with Quantile Regression."""
+    def __init__(self, hparams, update_freq=1, name='QuantileRiskNeuralBandit'):
+        self.name = name
+        self.hparams = hparams
+        self.update_freq = update_freq
+        
+        # Initialize modular components
+        opt = optax.adam(hparams.lr)
+        self.nn_model = QuantileNeuralBanditModel(opt, hparams, f"{name}-net")
+        self.critic = DistributionalCritic(self.nn_model)
+        
+        # Feature dimension is the last hidden layer size
+        self.phi_dim = hparams.layer_sizes[-1]
+        self.policy_manager = PolicyManager(hparams, self.phi_dim)
+        
+        self.data = BanditDataset(hparams.context_dim, hparams.num_actions, hparams.buffer_s, f"{name}-data")
+
+    def reset(self, seed):
+        self.nn_model.reset(seed)
+        self.policy_manager.Z_inv = jnp.eye(self.phi_dim) / self.hparams.lambd0
+        self.data.reset()
+
+    def train_offline_batch(self, contexts, actions, rewards):
+        """Train the Quantile NN and update the covariance matrix."""
+        # 1. Train the Distributional Critic
+        self.data.reset()
+        self.data.add(contexts, actions, rewards)
+        self.nn_model.train(self.data, self.hparams.num_steps)
+        
+        # 2. Rebuild Z_inv from scratch (offline batch) using Sherman-Morrison
+        self.policy_manager.Z_inv = jnp.eye(self.phi_dim) / self.hparams.lambd0
+        
+        num_samples = contexts.shape[0]
+        chunk_size = getattr(self.hparams, 'chunk_size', 500)
+        
+        if getattr(self.hparams, 'verbose', False):
+            print(f"[{self.name}] Updating Z_inv with Sherman-Morrison...")
+            pbar = tqdm(total=num_samples, desc="Updating Z_inv")
+            
+        for i in range(0, num_samples, chunk_size):
+            end = min(i + chunk_size, num_samples)
+            ctx_batch = contexts[i:end]
+            act_batch = actions[i:end]
+            
+            phi, _ = self.critic.get_phi_and_quantiles(self.nn_model.params, ctx_batch, act_batch)
+            
+            # Incremental updates for Z_inv
+            # We can use jax.vmap or a simple loop. Loop is safer for memory with Sherman-Morrison.
+            phi_np = np.array(phi)
+            for j in range(phi_np.shape[0]):
+                self.policy_manager.update_Z_inv(phi_np[j])
+                
+            if getattr(self.hparams, 'verbose', False):
+                pbar.update(end - i)
+                
+        if getattr(self.hparams, 'verbose', False):
+            pbar.close()
+
+    def sample_action(self, contexts):
+        """Choose actions using the PolicyManager's selection rule."""
+        return self.policy_manager.select_action(contexts, self.critic, self.nn_model.params)
+
+    def sample_action_milp(self, contexts):
+        """
+        Global/Marginal Risk optimization for Quantile Regression using MILP.
+        Maximizes CVaR of the aggregate reward distribution across all test contexts.
+        """
+        try:
+            import gurobipy as gp
+            from gurobipy import GRB
+        except ImportError:
+            print(f"[{self.name}] Gurobi not installed. Falling back to point-wise LCB.")
+            return self.sample_action(contexts)
+
+        num_samples = contexts.shape[0]
+        num_actions = self.hparams.num_actions
+        num_quantiles = self.nn_model.num_quantiles
+        alpha = getattr(self.hparams, 'alpha', 0.1)
+        beta = self.hparams.beta
+        L_rho = self.policy_manager.L # Lipschitz constant (1/alpha)
+        
+        # Pre-compute all quantiles and uncertainties
+        # quantiles_matrix: (num_samples, num_actions, num_quantiles)
+        # uncertainty_matrix: (num_samples, num_actions)
+        quantiles_matrix = np.zeros((num_samples, num_actions, num_quantiles))
+        uncertainty_matrix = np.zeros((num_samples, num_actions))
+        
+        if getattr(self.hparams, 'verbose', False):
+            print(f"[{self.name}] Pre-computing quantiles and uncertainty for MILP...")
+            
+        for a in range(num_actions):
+            acts = jnp.full((num_samples,), a)
+            phi, quantiles = self.critic.get_phi_and_quantiles(self.nn_model.params, contexts, acts)
+            u = self.policy_manager.get_uncertainty(phi)
+            
+            quantiles_matrix[:, a, :] = np.array(quantiles)
+            uncertainty_matrix[:, a] = np.array(u)
+
+        # MILP Formulation
+        # Maximize: zeta - (1 / (I * N * alpha)) * sum(s_in) - (beta * L / I) * sum(u_ij * z_ij)
+        # subject to:
+        #   s_in >= zeta - sum_j (q_ijn * z_ij)
+        #   sum_j z_ij = 1
+        
+        if getattr(self.hparams, 'verbose', False):
+            print(f'[{self.name}] Solving Marginal Quantile-CVaR LCB MILP...')
+            
+        env = gp.Env(empty=True)
+        env.setParam("OutputFlag", 1 if getattr(self.hparams, 'verbose', False) else 0)
+        env.start()
+        model = gp.Model("Quantile_Marginal_CVaR_MILP", env=env)
+        
+        I = num_samples
+        J = num_actions
+        N = num_quantiles
+        
+        z = model.addVars(I, J, vtype=GRB.BINARY, name="z")
+        zeta = model.addVar(vtype=GRB.CONTINUOUS, lb=-GRB.INFINITY, name="zeta")
+        s = model.addVars(I, N, vtype=GRB.CONTINUOUS, lb=0.0, name="s")
+        
+        tail_prob = alpha if alpha < 0.5 else (1.0 - alpha)
+        
+        cvar_term = zeta - (1.0 / (I * N * tail_prob)) * gp.quicksum(s[i, n] for i in range(I) for n in range(N))
+        penalty_term = (beta * L_rho / float(I)) * gp.quicksum(uncertainty_matrix[i, j] * z[i, j] for i in range(I) for j in range(J))
+        
+        model.setObjective(cvar_term - penalty_term, GRB.MAXIMIZE)
+        
+        for i in range(I):
+            model.addConstr(gp.quicksum(z[i, j] for j in range(J)) == 1)
+            for n in range(N):
+                reward_expr = gp.quicksum(quantiles_matrix[i, j, n] * z[i, j] for j in range(J))
+                model.addConstr(s[i, n] >= zeta - reward_expr)
+                
+        model.optimize()
+        
+        if model.status == GRB.OPTIMAL:
+            optimal_policy = np.zeros(I, dtype=int)
+            for i in range(I):
+                for j in range(J):
+                    if z[i, j].X > 0.5:
+                        optimal_policy[i] = j
+                        break
+            return jnp.array(optimal_policy)
+        else:
+            print(f'[{self.name}] MILP failed. Fallback to point-wise.')
             return self.sample_action(contexts)
