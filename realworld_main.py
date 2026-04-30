@@ -208,14 +208,15 @@ def main(unused_argv):
             hparams.beta, hparams.lambd, hparams.lambd0
         )
 
-    eval_m = FLAGS.policy_eval_method
+    eval_m = FLAGS.agent_eval_method
+    oracle_m = FLAGS.oracle_eval_method
     if FLAGS.algo_group == 'robust-offline':
         algos = [
             RobustOfflineBatchNeuraLCB(hparams)
         ]
         layer_str = "-".join([str(s) for s in layer_sizes])
-        algo_prefix = 'robust_{}_eval={}_risk={}_alpha={}_beta={}_n={}_layers={}'.format(
-            FLAGS.data_type, eval_m, FLAGS.risk_measure, FLAGS.alpha, FLAGS.beta, FLAGS.num_contexts, layer_str
+        algo_prefix = 'robust_{}_agent={}_oracle={}_risk={}_alpha={}_beta={}_n={}_layers={}'.format(
+            FLAGS.data_type, eval_m, oracle_m, FLAGS.risk_measure, FLAGS.alpha, FLAGS.beta, FLAGS.num_contexts, layer_str
         )
 
     if FLAGS.algo_group == 'neural-regression':
@@ -234,8 +235,8 @@ def main(unused_argv):
             RiskExactNeuraLCBV2(hparams)
         ]
         layer_str = "-".join([str(s) for s in layer_sizes])
-        algo_prefix = 'risk_exact_{}_eval={}_risk={}_alpha={}_beta={}_n={}_layers={}'.format(
-            FLAGS.data_type, eval_m, FLAGS.risk_measure, FLAGS.alpha, FLAGS.beta, FLAGS.num_contexts, layer_str
+        algo_prefix = 'risk_exact_{}_agent={}_oracle={}_risk={}_alpha={}_beta={}_n={}_layers={}'.format(
+            FLAGS.data_type, eval_m, oracle_m, FLAGS.risk_measure, FLAGS.alpha, FLAGS.beta, FLAGS.num_contexts, layer_str
         )
 
     if FLAGS.algo_group == 'quantile-risk':
@@ -243,8 +244,8 @@ def main(unused_argv):
             QuantileRiskNeuralBandit(hparams)
         ]
         layer_str = "-".join([str(s) for s in layer_sizes])
-        algo_prefix = 'quantile_risk_{}_eval={}_alpha={}_beta={}_n={}_layers={}'.format(
-            FLAGS.data_type, eval_m, FLAGS.alpha, FLAGS.beta, FLAGS.num_contexts, layer_str
+        algo_prefix = 'quantile_risk_{}_agent={}_oracle={}_alpha={}_beta={}_n={}_layers={}'.format(
+            FLAGS.data_type, eval_m, oracle_m, FLAGS.alpha, FLAGS.beta, FLAGS.num_contexts, layer_str
         )
 
     #==============================
