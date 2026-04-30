@@ -33,28 +33,28 @@ class RobustSyntheticData:
         # 1. Generate latent parameters (thetas or A)
         if self.function_type == 'quadratic2':
             # Matrix A for each action: (d, d, K)
-            A = np.random.normal(0, 1, (self.context_dim, self.context_dim, self.num_actions))
+            self.A = np.random.normal(0, 1, (self.context_dim, self.context_dim, self.num_actions))
         else:
             # Vectors a for each action: (d, K)
-            thetas = np.random.uniform(-1, 1, (self.context_dim, self.num_actions))
-            thetas /= np.linalg.norm(thetas, axis=0)[None, :]
+            self.thetas = np.random.uniform(-1, 1, (self.context_dim, self.num_actions))
+            self.thetas /= np.linalg.norm(self.thetas, axis=0)[None, :]
 
         # 2. Reward Function Definition
         def get_mean_rewards(X):
             # X: (N, d)
             if self.function_type == 'linear':
-                return X @ thetas
+                return X @ self.thetas
             elif self.function_type == 'quadratic':
-                return 10.0 * np.square(X @ thetas)
+                return 10.0 * np.square(X @ self.thetas)
             elif self.function_type == 'quadratic2':
-                # sum_d (X @ A_a)^2
                 res = []
                 for a in range(self.num_actions):
-                    res.append(np.sum(np.square(X @ A[:,:,a]), axis=1, keepdims=True))
+                    res.append(np.sum(np.square(X @ self.A[:,:,a]), axis=1, keepdims=True))
                 return np.hstack(res)
             elif self.function_type == 'cosine':
-                return np.cos(3.0 * X @ thetas)
-            return X @ thetas
+                return np.cos(3.0 * X @ self.thetas)
+            return X @ self.thetas
+        self.get_mean_rewards = get_mean_rewards
 
         # 3. Generate Contexts (Uniform on unit sphere)
         def sample_contexts(n):
@@ -90,30 +90,61 @@ class RobustSyntheticData:
 
     def get_oracle_optimal_actions(self, test_ctx, noise_samples, alpha):
         """Standard point-wise oracle (argmax of CVaR for each context)."""
-        # Note: Since noise is i.i.d across actions in this synthetic setup, 
-        # point-wise optimal is simply argmax of the mean.
-        # But to be general, we compute it.
-        from algorithms.neural_offline_bandit import DistributionalCritic
-        # We don't have a network here, but we have the true means.
-        # CVaR of (mean + noise) is just mean + CVaR(noise) if noise is same for all.
-        # So argmax(mean + CVaR(noise)) == argmax(mean).
-        # However, we'll implement it properly.
-        num_test = test_ctx.shape[0]
-        # In this simple synthetic case, test_mean is provided by reset_data.
-        # But we need access to it. We'll assume the caller passes it or we re-calculate.
-        # To avoid re-calculation, let's just return argmax(test_mean) if they are same.
-        # Actually, let's look at how realworld_main calls it.
-        # It calls it as data.get_oracle_optimal_actions(test_ctx, oracle_noise, FLAGS.alpha)
-        # We need the true means. Let's re-calculate them using the internal function.
-        # This is slightly inefficient but safe.
-        
-        # This is a bit complex since get_mean_rewards was local to reset_data.
-        # Let's just use the fact that in this setup, it's argmax(test_mean).
-        # Wait, I should have stored the thetas.
-        pass
+        test_mean = self.get_mean_rewards(test_ctx)
+        # In this i.i.d noise case, argmax CVaR is equivalent to argmax Mean.
+        return np.argmax(test_mean, axis=1)
 
     def get_oracle_optimal_actions_milp(self, test_ctx, alpha, noise_samples=None):
         """Marginal MILP oracle using true means."""
-        # This requires the true means which are not stored. 
-        # I will modify reset_data to store the internal reward function or params.
-        pass
+        test_mean = self.get_mean_rewards(test_ctx)
+        num_test = test_ctx.shape[0]
+        num_actions = self.num_actions
+        
+        if noise_samples is None:
+            # Fallback to mean if no noise samples provided
+            return np.argmax(test_mean, axis=1)
+            
+        num_noise = noise_samples.shape[0]
+        
+        import gurobipy as gp
+        from gurobipy import GRB
+        
+        env = gp.Env(empty=True)
+        env.setParam('OutputFlag', 0)
+        env.start()
+        model = gp.Model("Oracle_Marginal_CVaR", env=env)
+        
+        # Decision variables: z[i, a] = 1 if action a is chosen for context i
+        z = model.addVars(num_test, num_actions, vtype=GRB.BINARY, name="z")
+        
+        # Auxiliary variables for CVaR
+        zeta = model.addVar(lb=-GRB.INFINITY, name="zeta")
+        u = model.addVars(num_test, num_noise, lb=0.0, name="u")
+        
+        # Constraints: One action per context
+        for i in range(num_test):
+            model.addConstr(gp.quicksum(z[i, a] for a in range(num_actions)) == 1)
+            
+        # CVaR objective constraints: u_{i,k} >= zeta - (sum_a z_{i,a} * mu_{i,a} + noise_k)
+        for i in range(num_test):
+            for k in range(num_noise):
+                reward_ik = gp.quicksum(z[i, a] * test_mean[i, a] for a in range(num_actions)) + noise_samples[k]
+                model.addConstr(u[i, k] >= zeta - reward_ik)
+                
+        # Objective: Maximize CVaR = zeta - (1/(N*alpha)) * sum(u)
+        model.setObjective(zeta - (1.0 / (num_test * num_noise * alpha)) * gp.quicksum(u[i, k] for i in range(num_test) for k in range(num_noise)), GRB.MAXIMIZE)
+        
+        model.optimize()
+        
+        res_actions = np.zeros(num_test, dtype=int)
+        if model.status == GRB.OPTIMAL:
+            for i in range(num_test):
+                for a in range(num_actions):
+                    if z[i, a].X > 0.5:
+                        res_actions[i] = a
+                        break
+        else:
+            # Fallback
+            res_actions = np.argmax(test_mean, axis=1)
+            
+        return res_actions
