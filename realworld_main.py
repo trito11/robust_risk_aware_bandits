@@ -280,16 +280,59 @@ def main(unused_argv):
         all_gt_cvars  = [[] for _ in range(num_algos)]
         all_gt_means  = [[] for _ in range(num_algos)]
         all_gt_vars   = [[] for _ in range(num_algos)]
-        all_oracle_cvars = []
-        all_oracle_means = []
-        all_oracle_vars  = []
         all_times        = [[] for _ in range(num_algos)]
+        
+        # --- Pre-calculate Oracle once for all simulations ---
+        # Get test set and true means (fixed seed inside reset_data for test set)
+        _, _, _, test_ctx_full, test_mean_full = data.reset_data(0)
+        
+        if FLAGS.data_type == 'robust_syn':
+            oracle_state = np.random.RandomState(42)
+            oracle_noise = data.generate_noise(test_ctx_full.shape[0]) 
+            if hasattr(data, 'noise_type'):
+                if data.noise_type == 'student-t':
+                    oracle_noise = oracle_state.standard_t(df=2.1, size=(test_ctx_full.shape[0],))
+                elif data.noise_type == 'binary-heavy':
+                    delta = np.sqrt(1.0 / (40 * FLAGS.num_contexts))
+                    oracle_noise = oracle_state.choice([-1/delta, 1/delta, -delta, delta], 
+                                                    size=(test_ctx_full.shape[0],), p=[0.01, 0.01, 0.49, 0.49])
+                else:
+                    oracle_noise = oracle_state.normal(0, FLAGS.noise_std, size=(test_ctx_full.shape[0],))
+            
+            if FLAGS.oracle_eval_method == 'global':
+                print(f"[Oracle] Solving Marginal MILP once for N={FLAGS.num_contexts}...")
+                oracle_actions = data.get_oracle_optimal_actions_milp(test_ctx_full, FLAGS.alpha, noise_samples=oracle_noise)
+            else:
+                oracle_actions = data.get_oracle_optimal_actions(test_ctx_full, oracle_noise, FLAGS.alpha)
+            
+            opt_vals_full = test_mean_full[np.arange(test_mean_full.shape[0]), oracle_actions.ravel()]
+            
+            # Marginal CVaR for Oracle
+            I_test = test_ctx_full.shape[0]
+            M_noise = oracle_noise.shape[0]
+            expanded_opt_vals = np.repeat(opt_vals_full, M_noise)
+            expanded_noise = np.tile(oracle_noise, I_test)
+            oracle_noisy_r = expanded_opt_vals + expanded_noise
+            
+            oracle_mean = np.mean(oracle_noisy_r)
+            oracle_var  = np.var(oracle_noisy_r)
+            sorted_o = np.sort(oracle_noisy_r)
+            oracle_cvar = np.mean(sorted_o[:int(max(1, FLAGS.alpha * len(sorted_o)))])
+        else:
+            oracle_actions = np.argmax(test_mean_full, axis=1)
+            opt_vals_full = test_mean_full[np.arange(test_mean_full.shape[0]), oracle_actions.ravel()]
+            oracle_mean = np.mean(opt_vals_full)
+            oracle_var  = np.var(opt_vals_full)
+            oracle_cvar = 0.0
+            oracle_noise = None
 
         for sim in range(FLAGS.num_sim):
             print(f'Simulation: {sim + 1}/{FLAGS.num_sim}')
-
-            # 1. Reset data (same seed for all algos in a simulation)
+            
+            # 1. Reset data (Train set varies by sim, Test set is fixed inside)
             contexts, actions, rewards, test_ctx, test_mean = data.reset_data(sim)
+            # Re-use the pre-calculated oracle context/mean to ensure 100% consistency
+            test_ctx, test_mean = test_ctx_full, test_mean_full
 
             if len(rewards.shape) > 1:
                 n = contexts.shape[0]
@@ -297,43 +340,12 @@ def main(unused_argv):
             else:
                 beh_rewards = rewards
 
-            opt_actions = np.argmax(test_mean, axis=1)
-            # Oracle noise (computed once per sim)
-            if FLAGS.data_type == 'robust_syn':
-                oracle_noise = data.generate_noise(test_mean.shape[0])
-                # Determine Oracle CVaR based on oracle_eval_method
-                if FLAGS.oracle_eval_method == 'global':
-                    oracle_actions = data.get_oracle_optimal_actions_milp(test_ctx, FLAGS.alpha, noise_samples=oracle_noise)
-                else:
-                    oracle_actions = data.get_oracle_optimal_actions(test_ctx, oracle_noise, FLAGS.alpha)
-                
-                opt_vals = test_mean[np.arange(test_mean.shape[0]), oracle_actions.ravel()]
-                opt_actions = oracle_actions
-                
-                # Calculate Oracle Ground Truth Stats
-                # Marginal CVaR for Oracle
-                I_test = test_ctx.shape[0]
-                M_noise = oracle_noise.shape[0]
-                # Repeat means to match noise samples for marginal evaluation
-                expanded_opt_vals = np.repeat(opt_vals, M_noise)
-                expanded_noise = np.tile(oracle_noise, I_test)
-                oracle_noisy_r = expanded_opt_vals + expanded_noise
-                
-                oracle_mean = np.mean(oracle_noisy_r)
-                oracle_var  = np.var(oracle_noisy_r)
-                sorted_o = np.sort(oracle_noisy_r)
-                oracle_cvar = np.mean(sorted_o[:int(max(1, FLAGS.alpha * len(sorted_o)))])
-            else:
-                oracle_actions = np.argmax(test_mean, axis=1)
-                opt_vals = test_mean[np.arange(test_mean.shape[0]), oracle_actions.ravel()]
-                oracle_mean = np.mean(opt_vals)
-                oracle_var  = np.var(opt_vals)
-                oracle_cvar = 0.0 # Cannot compute CVaR without noise samples
-
             all_oracle_means.append(oracle_mean)
             all_oracle_vars.append(oracle_var)
             all_oracle_cvars.append(oracle_cvar)
-
+            
+            opt_vals = opt_vals_full
+            opt_actions = oracle_actions
             # 2. Train + evaluate each algo
             for ai, algo in enumerate(algos):
                 t0 = time.time()

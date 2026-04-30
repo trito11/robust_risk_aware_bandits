@@ -28,15 +28,16 @@ class RobustSyntheticData:
         self.eps = eps
 
     def reset_data(self, sim_id=0):
-        np.random.seed(sim_id)
+        # 0. Set a FIXED seed for Environment (thetas, test set) to ensure consistent Oracle
+        env_state = np.random.RandomState(42)
         
         # 1. Generate latent parameters (thetas or A)
         if self.function_type == 'quadratic2':
             # Matrix A for each action: (d, d, K)
-            self.A = np.random.normal(0, 1, (self.context_dim, self.context_dim, self.num_actions))
+            self.A = env_state.normal(0, 1, (self.context_dim, self.context_dim, self.num_actions))
         else:
             # Vectors a for each action: (d, K)
-            self.thetas = np.random.uniform(-1, 1, (self.context_dim, self.num_actions))
+            self.thetas = env_state.uniform(-1, 1, (self.context_dim, self.num_actions))
             self.thetas /= np.linalg.norm(self.thetas, axis=0)[None, :]
 
         # 2. Reward Function Definition
@@ -57,13 +58,20 @@ class RobustSyntheticData:
         self.get_mean_rewards = get_mean_rewards
 
         # 3. Generate Contexts (Uniform on unit sphere)
-        def sample_contexts(n):
-            X = np.random.normal(0, 1, (n, self.context_dim))
+        def sample_contexts(n, state=None):
+            if state is None:
+                X = np.random.normal(0, 1, (n, self.context_dim))
+            else:
+                X = state.normal(0, 1, (n, self.context_dim))
             X /= np.linalg.norm(X, axis=1, keepdims=True)
             return X
 
+        # Train set depends on sim_id
+        np.random.seed(sim_id)
         train_contexts = sample_contexts(self.num_contexts)
-        test_contexts = sample_contexts(self.num_test_contexts)
+        
+        # Test set is FIXED across sims and N values
+        test_contexts = sample_contexts(self.num_test_contexts, state=env_state)
         
         train_mean_r = get_mean_rewards(train_contexts)
         test_mean_r = get_mean_rewards(test_contexts)
