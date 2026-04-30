@@ -58,7 +58,7 @@ flags.DEFINE_bool('data_rand', True, 'Where randomly sample a data batch or  use
 flags.DEFINE_float('rbf_sigma', 1, 'RBF sigma for KernLCB') # [0.1, 1, 10]
 
 # Quantile Regression
-flags.DEFINE_integer('num_quantiles', 20, 'Number of quantiles for Quantile Regression')
+flags.DEFINE_integer('num_quantiles', 100, 'Number of quantiles for Quantile Regression')
 flags.DEFINE_float('huber_kappa', 1.0, 'Kappa parameter for Huber Loss')
 
 # NeuraLCB 

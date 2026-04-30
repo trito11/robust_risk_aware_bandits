@@ -334,7 +334,7 @@ class QuantileNeuralBanditModel(NeuralBanditModelV2):
     """Neural Network model for Quantile Regression in Bandits."""
 
     def __init__(self, optimizer, hparams, name='QuantileNeuralBanditModel'):
-        self.num_quantiles = getattr(hparams, 'num_quantiles', 20)
+        self.num_quantiles = getattr(hparams, 'num_quantiles', 100)
         self.kappa = getattr(hparams, 'huber_kappa', 1.0)
         super().__init__(optimizer, hparams, name)
 
