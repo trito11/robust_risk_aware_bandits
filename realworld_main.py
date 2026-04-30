@@ -355,10 +355,11 @@ def main(unused_argv):
                 else:
                     gt_mean = gt_var = gt_cvar = 0.0
 
+                subopt = oracle_cvar - gt_cvar
                 elapsed = time.time() - t0
                 print(f'  [{algo.name}] Regret={regret:.4f} | Acc={acc:.4f} '
                       f'| GT Mean/Var/CVaR={gt_mean:.2f}/{gt_var:.2f}/{gt_cvar:.2f} '
-                      f'| Oracle CVaR={oracle_cvar:.2f} | t={elapsed:.1f}s')
+                      f'| Oracle CVaR={oracle_cvar:.2f} | Subopt={subopt:.2f} | t={elapsed:.1f}s')
 
                 if FLAGS.use_wandb:
                     wandb.log({
