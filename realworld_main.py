@@ -207,13 +207,14 @@ def main(unused_argv):
             hparams.beta, hparams.lambd, hparams.lambd0
         )
 
+    eval_m = FLAGS.policy_eval_method
     if FLAGS.algo_group == 'robust-offline':
         algos = [
             RobustOfflineBatchNeuraLCB(hparams)
         ]
         layer_str = "-".join([str(s) for s in layer_sizes])
-        algo_prefix = 'robust_{}_risk={}_tau={}_beta={}_n={}_layers={}'.format(
-            FLAGS.data_type, FLAGS.risk_measure, FLAGS.tau_n, FLAGS.beta, FLAGS.num_contexts, layer_str
+        algo_prefix = 'robust_{}_eval={}_risk={}_alpha={}_beta={}_n={}_layers={}'.format(
+            FLAGS.data_type, eval_m, FLAGS.risk_measure, FLAGS.alpha, FLAGS.beta, FLAGS.num_contexts, layer_str
         )
 
     if FLAGS.algo_group == 'neural-regression':
@@ -232,8 +233,8 @@ def main(unused_argv):
             RiskExactNeuraLCBV2(hparams)
         ]
         layer_str = "-".join([str(s) for s in layer_sizes])
-        algo_prefix = 'risk_exact_{}_risk={}_beta={}_n={}_layers={}'.format(
-            FLAGS.data_type, FLAGS.risk_measure, FLAGS.beta, FLAGS.num_contexts, layer_str
+        algo_prefix = 'risk_exact_{}_eval={}_risk={}_alpha={}_beta={}_n={}_layers={}'.format(
+            FLAGS.data_type, eval_m, FLAGS.risk_measure, FLAGS.alpha, FLAGS.beta, FLAGS.num_contexts, layer_str
         )
 
     if FLAGS.algo_group == 'quantile-risk':
@@ -241,8 +242,8 @@ def main(unused_argv):
             QuantileRiskNeuralBandit(hparams)
         ]
         layer_str = "-".join([str(s) for s in layer_sizes])
-        algo_prefix = 'quantile_risk_{}_alpha={}_beta={}_n={}_layers={}'.format(
-            FLAGS.data_type, FLAGS.alpha, FLAGS.beta, FLAGS.num_contexts, layer_str
+        algo_prefix = 'quantile_risk_{}_eval={}_alpha={}_beta={}_n={}_layers={}'.format(
+            FLAGS.data_type, eval_m, FLAGS.alpha, FLAGS.beta, FLAGS.num_contexts, layer_str
         )
 
     #==============================
@@ -261,7 +262,7 @@ def main(unused_argv):
     #==============================
     file_name = os.path.join(res_dir, algo_prefix) + '.npz' 
 
-    if FLAGS.algo_group in ('robust-offline', 'neural-regression'):
+    if FLAGS.algo_group in ('robust-offline', 'neural-regression', 'risk-exact', 'quantile-risk'):
         # -------------------------------------------------------
         # Generic offline batch runner – works for any group that
         # uses the train_offline_batch / sample_action interface.
