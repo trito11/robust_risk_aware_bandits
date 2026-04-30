@@ -21,6 +21,7 @@ main_old.py
 main.py
 *.ipynb
 !plot_synthetic.ipynb 
+!plot_convergence.ipynb
 !plot_realworld.ipynb
 dev_main.py
 !/data/meta/
