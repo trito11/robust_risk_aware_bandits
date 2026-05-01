@@ -13,7 +13,7 @@ FLAGS = flags.FLAGS
 flags.DEFINE_integer('num_contexts', 2000, 'Number of training contexts')
 flags.DEFINE_integer('num_test', 50, 'Number of test contexts for MILP (keep small)')
 flags.DEFINE_integer('context_dim', 5, 'Context dimension')
-flags.DEFINE_integer('num_actions', 10, 'Number of actions')
+flags.DEFINE_integer('num_actions', 20, 'Number of actions')
 flags.DEFINE_float('alpha', 0.1, 'CVaR tail probability')
 
 # Giả lập class hparams để nạp vào thuật toán
@@ -153,13 +153,13 @@ def main(_):
     print(f"-> Local (Point-wise) GT CVaR  : {local_cvar:.4f}  (Time: {local_time:.3f}s)")
     print(f"-> Global (MILP) GT CVaR       : {global_cvar:.4f}  (Time: {global_time:.3f}s)")
     
-    if global_cvar > local_cvar:
-        print("\n=> KẾT LUẬN: Thuật toán MILP (Global) đã tìm ra tổ hợp hành động an toàn hơn (CVaR cao hơn) so với thuật toán Argmax (Local)!")
-    elif global_cvar == local_cvar:
-        print("\n=> KẾT LUẬN: Hai thuật toán cho ra Marginal CVaR tương đương nhau (MILP xác nhận Argmax đã tối ưu).")
-    else:
-        print("\n=> KẾT LUẬN: Point-wise ngẫu nhiên cho kết quả nhỉnh hơn (Hãy thử tăng số lượng Contexts hoặc điều chỉnh Beta).")
-    # Tính Oracle Optimal Policy
+    # if global_cvar > local_cvar:
+    #     print("\n=> KẾT LUẬN: Thuật toán MILP (Global) đã tìm ra tổ hợp hành động an toàn hơn (CVaR cao hơn) so với thuật toán Argmax (Local)!")
+    # elif global_cvar == local_cvar:
+    #     print("\n=> KẾT LUẬN: Hai thuật toán cho ra Marginal CVaR tương đương nhau (MILP xác nhận Argmax đã tối ưu).")
+    # else:
+    #     print("\n=> KẾT LUẬN: Point-wise ngẫu nhiên cho kết quả nhỉnh hơn (Hãy thử tăng số lượng Contexts hoặc điều chỉnh Beta).")
+    # # Tính Oracle Optimal Policy
     oracle_actions = get_oracle_optimal_actions(test_mean, true_noise, FLAGS.alpha)
     opt_cvar = compute_gt_marginal_cvar(test_mean, oracle_actions, true_noise, FLAGS.alpha)
 

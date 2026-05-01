@@ -7,22 +7,22 @@ FUNCTION_TYPE = "cosine"
 NOISE_TYPE = "student-t"
 CONTEXT_DIM = 20
 NUM_ACTIONS = 30
-LAYER_SIZES = "10"
+LAYER_SIZES = "32,32"
 BETA = 0.1
 RISK_MEASURE = "cvar"
 ALPHA = 0.05
 TAU_N = 1.0
 NUM_SIM = 10      # 500 runs to get stable statistics for the plot
 NUM_STEPS = 1000
-NUM_TEST = 50     # Number of test contexts (keep small for MILP)
+NUM_TEST = 500    # Number of test contexts (keep small for MILP)
 
 # Options added: ALGO_GROUP, AGENT_EVAL_METHOD, ORACLE_EVAL_METHOD
-ALGO_GROUP = "neural-regression" # "robust-offline", "neural-regression", "risk-exact", "quantile-risk"
+ALGO_GROUP = "risk-lin-lcb" # "robust-offline", "neural-regression", "risk-exact", "quantile-risk", "risk-lin-lcb"
 AGENT_EVAL_METHOD = "local"   # "local" (point-wise argmax) or "global" (MILP)
-ORACLE_EVAL_METHOD = "local" # "local" or "global" (Marginal CVaR via MILP)
+ORACLE_EVAL_METHOD = "global" # "local" or "global" (Marginal CVaR via MILP)
 
 # 2. Sweep over num_contexts (N)
-N_VALUES = [100, 500, 1000, 2000, 5000]
+N_VALUES = [100, 500, 1000, 2000, 5000, 10000, 20000, 50000]
 
 for n in N_VALUES:
     print(f"\n" + "="*60)

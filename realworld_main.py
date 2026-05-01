@@ -14,6 +14,7 @@ import time
 
 from core.contextual_bandit import contextual_bandit_runner
 from algorithms.neural_offline_bandit import ExactNeuraLCBV2, NeuralGreedyV2, ApproxNeuraLCBV2, RobustOfflineBatchNeuraLCB, NeuralRegressionOffline, RiskExactNeuraLCBV2, QuantileRiskNeuralBandit
+from algorithms.risk_lin_lcb import RiskLinLCB
 from algorithms.lin_lcb import LinLCB 
 from algorithms.kern_lcb import KernLCB 
 from algorithms.uniform_sampling import UniformSampling
@@ -181,7 +182,13 @@ def main(unused_argv):
             'lambd0': hparams.lambd0, 
             'beta': hparams.beta, 
             'rbf_sigma': FLAGS.rbf_sigma, # 0.1, 1, 10
-            'max_num_sample': 1000 
+            'max_num_sample': 1000,
+            'risk_measure': hparams.risk_measure,
+            'tau_n': hparams.tau_n,
+            'alpha': hparams.alpha,
+            'entropic_theta': hparams.entropic_theta,
+            'variance_lambda': hparams.variance_lambda,
+            'chunk_size': hparams.chunk_size
         }
     )
 
@@ -248,6 +255,14 @@ def main(unused_argv):
             FLAGS.data_type, eval_m, oracle_m, FLAGS.alpha, FLAGS.beta, FLAGS.num_contexts, layer_str
         )
 
+    if FLAGS.algo_group == 'risk-lin-lcb':
+        algos = [
+            RiskLinLCB(lin_hparams)
+        ]
+        algo_prefix = 'risk_lin_lcb_{}_agent={}_oracle={}_risk={}_alpha={}_beta={}_n={}'.format(
+            FLAGS.data_type, eval_m, oracle_m, FLAGS.risk_measure, FLAGS.alpha, FLAGS.beta, FLAGS.num_contexts
+        )
+
     #==============================
     # W&B Init
     #==============================
@@ -264,7 +279,7 @@ def main(unused_argv):
     #==============================
     file_name = os.path.join(res_dir, algo_prefix) + '.npz' 
 
-    if FLAGS.algo_group in ('robust-offline', 'neural-regression', 'risk-exact', 'quantile-risk'):
+    if FLAGS.algo_group in ('robust-offline', 'neural-regression', 'risk-exact', 'quantile-risk', 'risk-lin-lcb'):
         # -------------------------------------------------------
         # Generic offline batch runner – works for any group that
         # uses the train_offline_batch / sample_action interface.

@@ -1331,6 +1331,16 @@ class RiskExactNeuraLCBV2(ExactNeuraLCBV2):
     """
     def __init__(self, hparams, update_freq=1, name='RiskExactNeuraLCBV2'):
         super().__init__(hparams, update_freq, name)
+        # Shared confidence matrix for the entire dataset
+        self.Lambda_inv = jnp.eye(self.nn.num_params) / hparams.lambd0
+        self.historical_residuals = None
+        self.rho_residuals = None
+
+    def reset(self, seed):
+        """Reset network and the shared confidence matrix."""
+        self.Lambda_inv = jnp.eye(self.nn.num_params) / self.hparams.lambd0
+        self.nn.reset(seed)
+        self.data.reset()
         self.historical_residuals = None
         self.rho_residuals = None
 
@@ -1366,12 +1376,10 @@ class RiskExactNeuraLCBV2(ExactNeuraLCBV2):
         self.historical_residuals = rewards.ravel() - f_hist
         self.rho_residuals = self._compute_risk_functional(self.historical_residuals)
 
-        # 3. Update Confidence Matrix (Lambda_inv)
+        # 3. Update Shared Confidence Matrix (Lambda_inv)
         u = self.nn.grad_out(self.nn.params, contexts, actions) / jnp.sqrt(self.nn.m)
         for i in range(contexts.shape[0]):
-            self.Lambda_inv = self.Lambda_inv.at[actions[i]].set(
-                inv_sherman_morrison_single_sample(u[i,:], self.Lambda_inv[actions[i],:,:])
-            )
+            self.Lambda_inv = inv_sherman_morrison_single_sample(u[i,:], self.Lambda_inv)
 
     def sample_action(self, contexts):
         assert self.rho_residuals is not None, "Call update() first."
@@ -1388,7 +1396,7 @@ class RiskExactNeuraLCBV2(ExactNeuraLCBV2):
 
                 f = self.nn.out(self.nn.params, ctxs, actions_tmp) 
                 g = self.nn.grad_out(self.nn.params, ctxs, actions_tmp) / jnp.sqrt(self.nn.m)
-                gA = g @ self.Lambda_inv[a,:,:] 
+                gA = g @ self.Lambda_inv
                 
                 gAg = jnp.sum(jnp.multiply(gA, g), axis=-1) 
                 cnf = jnp.sqrt(gAg) 
@@ -1452,8 +1460,8 @@ class RiskExactNeuraLCBV2(ExactNeuraLCBV2):
                 g = self.nn.grad_out(self.nn.params, batch_contexts, actions_tmp) / jnp.sqrt(self.nn.m)
                 
                 if hasattr(self, 'Lambda_inv'):
-                    # Approx version (Action-specific)
-                    gA = g @ self.Lambda_inv[a, :, :] 
+                    # Shared/Exact version
+                    gA = g @ self.Lambda_inv
                     gAg = jnp.sum(jnp.multiply(gA, g), axis=-1) 
                 else:
                     # Exact version (Shared Z_inv)
