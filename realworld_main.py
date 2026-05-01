@@ -336,6 +336,10 @@ def main(unused_argv):
             oracle_var  = np.var(oracle_noisy_r)
             sorted_o = np.sort(oracle_noisy_r)
             oracle_cvar = np.mean(sorted_o[:int(max(1, FLAGS.alpha * len(sorted_o)))])
+
+            # --- Oracle Mean (For Standard Regret) ---
+            # The absolute best expected reward regardless of risk
+            mean_opt_vals_full = np.max(test_mean_full, axis=1) 
         else:
             oracle_actions = np.argmax(test_mean_full, axis=1)
             opt_vals_full = test_mean_full[np.arange(test_mean_full.shape[0]), oracle_actions.ravel()]
@@ -379,8 +383,11 @@ def main(unused_argv):
                 else:
                     test_actions = algo.sample_action(test_ctx)
                 sel_vals = test_mean[np.arange(test_mean.shape[0]), test_actions.ravel()]
-
-                regret = np.mean(opt_vals - sel_vals)
+                
+                # 1. Reward Regret: Loss in expected value vs Mean-Optimal policy
+                # (Note: mean_opt_vals_full is sliced to match current test_mean if needed)
+                current_mean_opt = mean_opt_vals_full[:test_mean.shape[0]]
+                regret = np.mean(current_mean_opt - sel_vals)
                 acc    = np.mean(test_actions.ravel() == opt_actions.ravel())
 
                 # Ground-truth risk stats (Calculated Marginally for accuracy)
