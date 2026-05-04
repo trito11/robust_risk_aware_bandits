@@ -107,8 +107,14 @@ class RiskLinLCB(BanditAlgorithm):
                 x = cho_solve((c, low), phi_a.T) # (p, B)
                 R_a = jnp.sqrt(jnp.sum(phi_a * x.T, axis=1))
                 
-                # Final Risk-Aware LCB
-                lcb_a = risk_a - beta * L_rho * R_a
+                # Final Policy Selection
+                policy_type = getattr(self.hparams, 'policy_type', 'risk-aware')
+                if policy_type == 'standard-lcb':
+                    lcb_a = mu_a - beta * R_a
+                else:
+                    # Risk-Aware LCB (Default)
+                    lcb_a = risk_a - beta * L_rho * R_a
+                
                 lcbs.append(lcb_a.reshape(-1, 1))
                 
             batch_LCBs = jnp.hstack(lcbs)

@@ -77,6 +77,7 @@ flags.DEFINE_float('variance_lambda', 0.1, 'Lambda for mean-variance')
 flags.DEFINE_string('truncation_mode', 'clip', 'clip or mask')
 flags.DEFINE_string('noise_type', 'student-t', 'student-t, gaussian, binary-heavy')
 flags.DEFINE_string('function_type', 'quadratic', 'linear, quadratic, quadratic2, cosine')
+flags.DEFINE_string('policy_type', 'risk-aware', 'risk-aware or standard-lcb')
 flags.DEFINE_string('save_model_path', 'results/model.pkl', 'Path to save weights after training')
 
 # Logging
@@ -172,7 +173,8 @@ def main(unused_argv):
         'alpha': FLAGS.alpha,
         'entropic_theta': FLAGS.entropic_theta,
         'variance_lambda': FLAGS.variance_lambda,
-        'truncation_mode': FLAGS.truncation_mode
+        'truncation_mode': FLAGS.truncation_mode,
+        'policy_type': FLAGS.policy_type
     })
 
     lin_hparams = edict(
@@ -188,7 +190,8 @@ def main(unused_argv):
             'alpha': hparams.alpha,
             'entropic_theta': hparams.entropic_theta,
             'variance_lambda': hparams.variance_lambda,
-            'chunk_size': hparams.chunk_size
+            'chunk_size': hparams.chunk_size,
+            'policy_type': hparams.policy_type
         }
     )
 
