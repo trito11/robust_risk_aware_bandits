@@ -1403,15 +1403,20 @@ class RiskExactNeuraLCBV2(ExactNeuraLCBV2):
         self.historical_residuals = rewards.ravel() - f_hist
         self.rho_residuals = self._compute_risk_functional(self.historical_residuals)
 
-        # 3. Cập nhật Sherman-Morrison TUẦN TỰ trên ma trận GLOBAL
-        u = self.nn.grad_out(self.nn.params, contexts, actions) / jnp.sqrt(self.nn.m)
+        # 3. Cập nhật Sherman-Morrison TUẦN TỰ trên ma trận GLOBAL (Tối ưu Chunked để tránh OOM)
+        num_train = contexts.shape[0]
+        update_chunk_size = getattr(self.hparams, 'update_chunk_size', 100)
         
-        # TỐI ƯU: Sử dụng jax.lax.scan để chạy toàn bộ vòng lặp trên GPU
         def body_fn(A_inv, ui):
             new_A_inv = inv_sherman_morrison_single_sample(ui, A_inv)
             return new_A_inv, None
-        
-        self.Lambda_inv, _ = jax.lax.scan(body_fn, self.Lambda_inv, u)
+
+        for i in range(0, num_train, update_chunk_size):
+            end_idx = min(i + update_chunk_size, num_train)
+            # Tính Gradient cho lô nhỏ
+            u_batch = self.nn.grad_out(self.nn.params, contexts[i:end_idx], actions[i:end_idx]) / jnp.sqrt(self.nn.m)
+            # Cập nhật tuần tự trên GPU cho lô này
+            self.Lambda_inv, _ = jax.lax.scan(body_fn, self.Lambda_inv, u_batch)
 
     def train_offline_batch(self, contexts, actions, rewards):
         """Wrapper huấn luyện offline cho compatibility."""

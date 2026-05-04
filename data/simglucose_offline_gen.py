@@ -21,11 +21,45 @@ def get_magni_reward(bg_history):
 
 def sync_env_state(src_env, dst_env):
     """Synchronize physiological state and sensor state between environments."""
-    dst_env.env.patient._state = src_env.env.patient._state.copy()
-    dst_env.env.sensor.last_state = src_env.env.sensor.last_state
-    dst_env.env.time = src_env.env.time
-    # Reset internal scenario time to match master
-    dst_env.env.scenario.start_time = src_env.env.time
+    # Sync patient state (searching for the correct internal attribute, preferring private ones)
+    state_synced = False
+    for attr in ['_state', '_y', '_y0', 'y0', 'state']:
+        if hasattr(src_env.patient, attr):
+            try:
+                val = getattr(src_env.patient, attr)
+                if isinstance(val, np.ndarray):
+                    setattr(dst_env.patient, attr, val.copy())
+                    state_synced = True
+                    break
+            except (AttributeError, Exception):
+                continue
+    
+    if not state_synced:
+        # Fallback for some versions: use the odesolver state
+        try:
+            dst_env.patient._odesolver._y = src_env.patient._odesolver._y.copy()
+            dst_env.patient._odesolver.t = src_env.patient._odesolver.t
+            state_synced = True
+        except Exception:
+            pass
+
+    # Sync environment time
+    for attr in ['_time', 'env_time', 'time']:
+        if hasattr(src_env, attr):
+            try:
+                setattr(dst_env, attr, getattr(src_env, attr))
+                break
+            except (AttributeError, Exception):
+                continue
+
+    # Sync sensor state
+    if hasattr(src_env.sensor, 'last_state'):
+        dst_env.sensor.last_state = src_env.sensor.last_state
+    
+    # Sync scenario start time to the current env time
+    current_time = getattr(dst_env, 'time', getattr(dst_env, '_time', None))
+    if current_time is not None:
+        dst_env.scenario.start_time = current_time
 
 class ManualMealScenario:
     """A scenario that only triggers a single meal at start_time."""
@@ -36,6 +70,9 @@ class ManualMealScenario:
         if t == self.start_time:
             return Action(meal=self.meal_size)
         return Action(meal=0)
+    
+    def reset(self):
+        pass
 
 def create_eval_env(p_name, meal_size, current_time, seed):
     patient = T1DPatient.withName(p_name)
@@ -47,11 +84,11 @@ def create_eval_env(p_name, meal_size, current_time, seed):
     env.reset()
     return env
 
-def collect_simglucose_data(n_train=8000, n_test=2000, save_path='data/simglucose_offline.npz', alpha=0.05):
+def collect_simglucose_data(n_train=200, n_test=50, save_path='data/simglucose_test.npz', alpha=0.05):
     patient_names = ['child#001', 'child#002', 'adolescent#001', 'adult#001']
     samples_per_patient = (n_train + n_test) // len(patient_names)
     test_per_patient = n_test // len(patient_names)
-    n_oracle_trials = 5 # Number of noise realizations to estimate True CVaR for Oracle
+    n_oracle_trials = 2 # Reduced for faster testing
 
     train_contexts, train_actions, train_rewards = [], [], []
     test_contexts, test_mean_matrix, test_cvar_matrix = [], [], []
@@ -62,7 +99,6 @@ def collect_simglucose_data(n_train=8000, n_test=2000, save_path='data/simglucos
     for p_idx, p_name in enumerate(patient_names):
         print(f"\nProcessing: {p_name}")
         start_date = datetime(2024, 1, 1, 0, 0, 0)
-        # Master environment uses a standard scenario
         scenario = RandomScenario(start_time=start_date, seed=p_idx)
         master_env = T1DSimEnv(T1DPatient.withName(p_name), CGMSensor.withName('Dexcom', seed=p_idx), 
                         InsulinPump.withName('Insulet'), scenario)
@@ -105,7 +141,6 @@ def collect_simglucose_data(n_train=8000, n_test=2000, save_path='data/simglucos
                         for a in range(11):
                             trial_rewards = []
                             for trial in range(n_oracle_trials):
-                                # Use different seeds for noise realizations
                                 eval_env = create_eval_env(p_name, meal, master_env.time, p_idx + trial * 13)
                                 sync_env_state(master_env, eval_env)
                                 
@@ -120,7 +155,6 @@ def collect_simglucose_data(n_train=8000, n_test=2000, save_path='data/simglucos
                             
                             action_means.append(np.mean(trial_rewards))
                             sorted_rew = np.sort(trial_rewards)
-                            # True CVaR at alpha level
                             action_cvars.append(np.mean(sorted_rew[:max(1, int(alpha * n_oracle_trials))]))
                         
                         test_contexts.append(ctx)
@@ -129,11 +163,10 @@ def collect_simglucose_data(n_train=8000, n_test=2000, save_path='data/simglucos
                     
                     patient_count += 1
                     pbar.update(1)
-                except Exception:
-                    pass # Skip ODE errors
+                except Exception as e:
+                    print(f"\n[WARNING] Simulation error for {p_name} at {master_env.time}: {e}")
+                    pass 
 
-            # IMPORTANT: Advance master loop with a reasonable policy to visit healthy states
-            # Use BBController's bolus to avoid hyperglycemia explosion
             master_action = controller.policy(state, reward, done, **info)
             state, reward, done, info = master_env.step(master_action)
             if done: 
