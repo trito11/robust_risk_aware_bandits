@@ -28,6 +28,7 @@ class SimglucoseData:
         
         self.test_contexts = data['test_contexts'].astype(np.float32)
         self.test_mean = data['test_mean'].astype(np.float32) # Matrix (N_test, 11)
+        self.test_cvar = data['test_cvar'].astype(np.float32) if 'test_cvar' in data else None
         
         # Basic information
         self.num_contexts = len(self.train_contexts)

@@ -348,11 +348,20 @@ def main(unused_argv):
             # The absolute best expected reward regardless of risk
             mean_opt_vals_full = np.max(test_mean_full, axis=1) 
         else:
-            oracle_actions = np.argmax(test_mean_full, axis=1)
-            opt_vals_full = test_mean_full[np.arange(test_mean_full.shape[0]), oracle_actions.ravel()]
+            # Simglucose or other real-world data
+            if FLAGS.data_type == 'simglucose' and hasattr(data, 'test_cvar') and data.test_cvar is not None:
+                # Use pre-calculated True CVaR for Simglucose
+                # Oracle actions are chosen based on the best CVaR
+                oracle_actions = np.argmax(data.test_cvar, axis=1)
+                opt_vals_full = test_mean_full[np.arange(test_mean_full.shape[0]), oracle_actions.ravel()]
+                oracle_cvar = np.mean(data.test_cvar[np.arange(data.test_cvar.shape[0]), oracle_actions.ravel()])
+            else:
+                oracle_actions = np.argmax(test_mean_full, axis=1)
+                opt_vals_full = test_mean_full[np.arange(test_mean_full.shape[0]), oracle_actions.ravel()]
+                oracle_cvar = 0.0
+            
             oracle_mean = np.mean(opt_vals_full)
             oracle_var  = np.var(opt_vals_full)
-            oracle_cvar = 0.0
             oracle_noise = None
 
         for sim in range(FLAGS.num_sim):
