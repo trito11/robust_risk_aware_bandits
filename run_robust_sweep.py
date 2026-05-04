@@ -2,7 +2,7 @@ import subprocess
 import os
 
 # 1. Danh sách cấu hình thực nghiệm
-ALGO_GROUPS = ["robust-offline"]
+ALGO_GROUPS = ["risk-exact"]
 FUNCTION_TYPES = ["linear", "quadratic"]  # Bạn có thể thêm "linear", "quadratic2"
 N_VALUES = [100, 500, 1000, 5000, 10000, 20000, 50000]
 

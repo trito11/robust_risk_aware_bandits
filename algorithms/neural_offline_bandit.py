@@ -22,6 +22,7 @@ class ExactNeuraLCBV2(BanditAlgorithm):
         self.nn = NeuralBanditModelV2(opt, hparams, '{}-net'.format(name))
         self.data = BanditDataset(hparams.context_dim, hparams.num_actions, hparams.buffer_s, '{}-data'.format(name))
 
+        import numpy as np
         p = self.nn.num_params
         k = hparams.num_actions
         # Prevent OOM if p is large
@@ -30,11 +31,11 @@ class ExactNeuraLCBV2(BanditAlgorithm):
                 print(f'[{name}] p is large ({p}). Using lazy/CPU initialization for Lambda_inv.')
             self.Lambda_inv = None 
         else:
-            self.Lambda_inv = jnp.array(
+            self.Lambda_inv = jax.device_put(jnp.array(
                 [
-                    jnp.eye(p)/hparams.lambd0 for _ in range(k)
+                    np.eye(p, dtype=np.float32)/hparams.lambd0 for _ in range(k)
                 ]
-            ) # (num_actions, p, p)
+            )) # (num_actions, p, p)
 
     def reset(self, seed): 
         p = self.nn.num_params
@@ -690,10 +691,8 @@ class RobustOfflineBatchNeuraLCB(BanditAlgorithm):
 
         # Step 4: Exact Covariance Matrix Z
         p = self.nn.num_params
-        if self.hparams.verbose:
-            print(f'[{self.name}] Computing Z matrix on GPU (p={p})...')
-            
-        Z = self.hparams.lambd0 * jnp.eye(p)
+        import numpy as np
+        Z = jax.device_put(np.eye(p, dtype=np.float32) * float(self.hparams.lambd0))
         
         num_train = contexts.shape[0]
         z_chunk_size = getattr(self.hparams, 'chunk_size', 500)
@@ -1352,14 +1351,16 @@ class RiskExactNeuraLCBV2(ExactNeuraLCBV2):
         super().__init__(hparams, update_freq, name)
         # Shared confidence matrix for the entire dataset
         p = self.nn.num_params
-        self.Lambda_inv = jnp.eye(p) / hparams.lambd0
+        import numpy as np
+        self.Lambda_inv = jax.device_put(np.eye(p, dtype=np.float32) / float(hparams.lambd0))
         self.historical_residuals = None
         self.rho_residuals = None
 
     def reset(self, seed):
         """Reset network and the shared confidence matrix."""
         p = self.nn.num_params
-        self.Lambda_inv = jnp.eye(p) / self.hparams.lambd0
+        import numpy as np
+        self.Lambda_inv = jax.device_put(np.eye(p, dtype=np.float32) / float(self.hparams.lambd0))
         self.nn.reset(seed)
         self.data.reset()
         self.historical_residuals = None
@@ -1399,10 +1400,8 @@ class RiskExactNeuraLCBV2(ExactNeuraLCBV2):
 
         # 3. Update Shared Confidence Matrix
         p = self.nn.num_params
-        if self.hparams.verbose:
-            print(f'[{self.name}] Computing Z matrix on GPU (p={p})...')
-            
-        Z = self.hparams.lambd0 * jnp.eye(p)
+        import numpy as np
+        Z = jax.device_put(np.eye(p, dtype=np.float32) * float(self.hparams.lambd0))
         
         num_train = contexts.shape[0]
         chunk_size = getattr(self.hparams, 'chunk_size', 500)
