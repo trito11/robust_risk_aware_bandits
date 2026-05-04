@@ -1396,8 +1396,7 @@ class RiskExactNeuraLCBV2(ExactNeuraLCBV2):
         for i in range(contexts.shape[0]):
             a = actions[i]
             # Cập nhật ma trận nghịch đảo cục bộ cho hành động a bằng Sherman-Morrison
-            self.Lambda_inv = jax.ops.index_update(
-                self.Lambda_inv, a, 
+            self.Lambda_inv = self.Lambda_inv.at[a].set(
                 inv_sherman_morrison_single_sample(u[i,:], self.Lambda_inv[a,:,:])
             )
 
