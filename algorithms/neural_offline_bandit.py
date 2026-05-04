@@ -1406,9 +1406,12 @@ class RiskExactNeuraLCBV2(ExactNeuraLCBV2):
         # 3. Cập nhật Sherman-Morrison TUẦN TỰ trên ma trận GLOBAL
         u = self.nn.grad_out(self.nn.params, contexts, actions) / jnp.sqrt(self.nn.m)
         
-        for i in range(contexts.shape[0]):
-            # Cập nhật vào ma trận Global duy nhất
-            self.Lambda_inv = inv_sherman_morrison_single_sample(u[i,:], self.Lambda_inv)
+        # TỐI ƯU: Sử dụng jax.lax.scan để chạy toàn bộ vòng lặp trên GPU
+        def body_fn(A_inv, ui):
+            new_A_inv = inv_sherman_morrison_single_sample(ui, A_inv)
+            return new_A_inv, None
+        
+        self.Lambda_inv, _ = jax.lax.scan(body_fn, self.Lambda_inv, u)
 
     def train_offline_batch(self, contexts, actions, rewards):
         """Wrapper huấn luyện offline cho compatibility."""
