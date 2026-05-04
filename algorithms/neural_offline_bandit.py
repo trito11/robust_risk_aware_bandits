@@ -22,18 +22,29 @@ class ExactNeuraLCBV2(BanditAlgorithm):
         self.nn = NeuralBanditModelV2(opt, hparams, '{}-net'.format(name))
         self.data = BanditDataset(hparams.context_dim, hparams.num_actions, hparams.buffer_s, '{}-data'.format(name))
 
-        self.Lambda_inv = jnp.array(
-            [
-                jnp.eye(self.nn.num_params)/hparams.lambd0 for _ in range(hparams.num_actions)
-            ]
-        ) # (num_actions, p, p)
+        p = self.nn.num_params
+        k = hparams.num_actions
+        # Prevent OOM if p is large
+        if p * p * k * 4 > 4 * 1024**3: # 4GB threshold
+            if self.hparams.verbose:
+                print(f'[{name}] p is large ({p}). Using lazy/CPU initialization for Lambda_inv.')
+            self.Lambda_inv = None 
+        else:
+            self.Lambda_inv = jnp.array(
+                [
+                    jnp.eye(p)/hparams.lambd0 for _ in range(k)
+                ]
+            ) # (num_actions, p, p)
 
     def reset(self, seed): 
-        self.Lambda_inv = jnp.array(
-            [
-                jnp.eye(self.nn.num_params)/ self.hparams.lambd0 for _ in range(self.hparams.num_actions)
-            ]
-        ) # (num_actions, p, p)
+        p = self.nn.num_params
+        k = self.hparams.num_actions
+        if self.Lambda_inv is not None:
+            self.Lambda_inv = jnp.array(
+                [
+                    jnp.eye(p)/ self.hparams.lambd0 for _ in range(k)
+                ]
+            ) # (num_actions, p, p)
 
         self.nn.reset(seed) 
         self.data.reset()
@@ -1233,30 +1244,41 @@ class OfflineBatchNeuraLCB(BanditAlgorithm):
         # Residuals are calculated using RAW rewards to preserve heavy-tail info for risk evaluation.
         f_hist = self.nn.out(self.nn.params, contexts, actions).ravel()
         self.historical_residuals = rewards.ravel() - f_hist
-
         p = self.nn.num_params
-        Z = self.hparams.lambd0 * jnp.eye(p)
+        import numpy as np
+        if self.hparams.verbose:
+            print(f'[{self.name}] Computing Z matrix on CPU (p={p})...')
+            
+        Z_cpu = np.eye(p, dtype=np.float32) * float(self.hparams.lambd0)
         
         num_train = contexts.shape[0]
         z_chunk_size = getattr(self.hparams, 'chunk_size', 500)
         
         if self.hparams.verbose:
-            print(f'[{self.name}] Computing Z matrix in chunks (p={p})...')
-            pbar = tqdm(total=num_train, desc="Computing Z Matrix", unit="samples")
+            pbar = tqdm(total=num_train, desc="Computing Z Matrix (CPU)", unit="samples")
 
         for i in range(0, num_train, z_chunk_size):
             end_idx = min(i + z_chunk_size, num_train)
             g_chunk = self.nn.grad_out(self.nn.params, contexts[i:end_idx], actions[i:end_idx]) / jnp.sqrt(self.nn.m)
-            Z = Z + g_chunk.T @ g_chunk
-            del g_chunk
+            g_chunk_cpu = np.array(jax.device_get(g_chunk))
+            Z_cpu += g_chunk_cpu.T @ g_chunk_cpu
+            del g_chunk, g_chunk_cpu
             if self.hparams.verbose:
                 pbar.update(end_idx - i)
 
         if self.hparams.verbose:
             pbar.close()
+            print(f'[{self.name}] Inverting Z on CPU...')
 
-        self.Z_inv = jnp.linalg.inv(Z)
-        del Z
+        Z_inv_cpu = np.linalg.inv(Z_cpu)
+        if p > 30000:
+            self.Z_inv = Z_inv_cpu
+            self.Z_inv_on_cpu = True
+        else:
+            self.Z_inv = jax.device_put(Z_inv_cpu)
+            self.Z_inv_on_cpu = False
+            
+        del Z_cpu, Z_inv_cpu
 
         # Evaluate risk functional of residuals purely for offline evaluation compatibility
         self.rho_residuals = self._compute_risk_functional(self.historical_residuals, axis=0)
@@ -1368,13 +1390,27 @@ class RiskExactNeuraLCBV2(ExactNeuraLCBV2):
     def __init__(self, hparams, update_freq=1, name='RiskExactNeuraLCBV2'):
         super().__init__(hparams, update_freq, name)
         # Shared confidence matrix for the entire dataset
-        self.Lambda_inv = jnp.eye(self.nn.num_params) / hparams.lambd0
+        p = self.nn.num_params
+        if p > 30000:
+            self.Lambda_inv = np.eye(p, dtype=np.float32) / float(hparams.lambd0)
+            self.Lambda_inv_on_cpu = True
+        else:
+            self.Lambda_inv = jnp.eye(p) / hparams.lambd0
+            self.Lambda_inv_on_cpu = False
+            
         self.historical_residuals = None
         self.rho_residuals = None
 
     def reset(self, seed):
         """Reset network and the shared confidence matrix."""
-        self.Lambda_inv = jnp.eye(self.nn.num_params) / self.hparams.lambd0
+        p = self.nn.num_params
+        if p > 30000:
+            self.Lambda_inv = np.eye(p, dtype=np.float32) / float(self.hparams.lambd0)
+            self.Lambda_inv_on_cpu = True
+        else:
+            self.Lambda_inv = jnp.eye(p) / self.hparams.lambd0
+            self.Lambda_inv_on_cpu = False
+            
         self.nn.reset(seed)
         self.data.reset()
         self.historical_residuals = None
@@ -1415,19 +1451,33 @@ class RiskExactNeuraLCBV2(ExactNeuraLCBV2):
         # 3. Update Shared Confidence Matrix (Moved to CPU for memory stability)
         p = self.nn.num_params
         import numpy as np
-        Z = np.eye(p) * self.hparams.lambd0
+        if self.hparams.verbose:
+            print(f'[{self.name}] Computing Z matrix on CPU (p={p})...')
+            
+        Z = np.eye(p, dtype=np.float32) * float(self.hparams.lambd0)
         
         num_train = contexts.shape[0]
         chunk_size = getattr(self.hparams, 'chunk_size', 500)
         
         for i in range(0, num_train, chunk_size):
             end_idx = min(i + chunk_size, num_train)
-            g_chunk = jax.device_get(self.nn.grad_out(self.nn.params, contexts[i:end_idx], actions[i:end_idx]) / jnp.sqrt(self.nn.m))
-            Z += g_chunk.T @ g_chunk
-            del g_chunk
+            g_chunk = self.nn.grad_out(self.nn.params, contexts[i:end_idx], actions[i:end_idx]) / jnp.sqrt(self.nn.m)
+            g_chunk_cpu = np.array(jax.device_get(g_chunk))
+            Z += g_chunk_cpu.T @ g_chunk_cpu
+            del g_chunk, g_chunk_cpu
 
-        self.Lambda_inv = jax.device_put(np.linalg.inv(Z))
-        del Z
+        if self.hparams.verbose:
+            print(f'[{self.name}] Inverting Z on CPU...')
+            
+        Z_inv_cpu = np.linalg.inv(Z)
+        if p > 30000:
+            self.Lambda_inv = Z_inv_cpu
+            self.Lambda_inv_on_cpu = True
+        else:
+            self.Lambda_inv = jax.device_put(Z_inv_cpu)
+            self.Lambda_inv_on_cpu = False
+            
+        del Z, Z_inv_cpu
 
     def sample_action(self, contexts):
         assert self.rho_residuals is not None, "Call update() first."
@@ -1444,10 +1494,15 @@ class RiskExactNeuraLCBV2(ExactNeuraLCBV2):
 
                 f = self.nn.out(self.nn.params, ctxs, actions_tmp) 
                 g = self.nn.grad_out(self.nn.params, ctxs, actions_tmp) / jnp.sqrt(self.nn.m)
-                gA = g @ self.Lambda_inv
                 
-                gAg = jnp.sum(jnp.multiply(gA, g), axis=-1) 
-                cnf = jnp.sqrt(gAg) 
+                if getattr(self, 'Lambda_inv_on_cpu', False):
+                    g_cpu = np.array(jax.device_get(g))
+                    gAg_cpu = np.sum((g_cpu @ self.Lambda_inv) * g_cpu, axis=-1)
+                    cnf = jnp.array(np.sqrt(gAg_cpu))
+                else:
+                    gA = g @ self.Lambda_inv
+                    gAg = jnp.sum(jnp.multiply(gA, g), axis=-1) 
+                    cnf = jnp.sqrt(gAg) 
 
                 # ========================================================
                 # TRANSITION FROM MEAN TO RISK-AWARE: rho(F) - L * R(pi)
@@ -1507,16 +1562,14 @@ class RiskExactNeuraLCBV2(ExactNeuraLCBV2):
                 # Uncertainty
                 g = self.nn.grad_out(self.nn.params, batch_contexts, actions_tmp) / jnp.sqrt(self.nn.m)
                 
-                if hasattr(self, 'Lambda_inv'):
-                    # Shared/Exact version
-                    gA = g @ self.Lambda_inv
-                    gAg = jnp.sum(jnp.multiply(gA, g), axis=-1) 
+                if getattr(self, 'Lambda_inv_on_cpu', False):
+                    g_cpu = np.array(jax.device_get(g))
+                    gAg_cpu = np.sum((g_cpu @ self.Lambda_inv) * g_cpu, axis=-1)
+                    R_a = np.sqrt(gAg_cpu)
                 else:
-                    # Exact version (Shared Z_inv)
-                    gA = g @ self.Z_inv
+                    gA = g @ self.Lambda_inv
                     gAg = jnp.sum(jnp.multiply(gA, g), axis=-1)
-                
-                R_a = jnp.sqrt(gAg)
+                    R_a = jnp.sqrt(gAg)
                 
                 mu_a_full.append(np.array(mu_a))
                 R_a_full.append(np.array(R_a))
