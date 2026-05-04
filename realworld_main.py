@@ -195,8 +195,12 @@ def main(unused_argv):
         }
     )
 
-    data_prefix = '{}_d={}_a={}_pi={}_std={}'.format(FLAGS.data_type, \
-            context_dim, num_actions, policy_prefix, data.noise_std if hasattr(data, 'noise_std') else 'N/A')
+    if FLAGS.data_type == 'robust_syn':
+        data_prefix = '{}_{}_d={}_a={}_pi={}_std={}'.format(FLAGS.data_type, FLAGS.function_type, \
+                context_dim, num_actions, policy_prefix, data.noise_std if hasattr(data, 'noise_std') else 'N/A')
+    else:
+        data_prefix = '{}_d={}_a={}_pi={}_std={}'.format(FLAGS.data_type, \
+                context_dim, num_actions, policy_prefix, data.noise_std if hasattr(data, 'noise_std') else 'N/A')
 
     res_dir = os.path.join('results', data_prefix) 
 
