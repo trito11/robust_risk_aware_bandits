@@ -1345,30 +1345,16 @@ class OfflineBatchNeuraLCB(BanditAlgorithm):
             mse = float(jnp.mean(jnp.square(f - rewards.ravel())))
             print(f'[{self.name}] MSE={mse:.4f}')
         else:
-            print(f'[{self.name}] Model ready.')
-
+            print(f'[{self.name}] Model ready')
 
 class RiskExactNeuraLCBV2(ExactNeuraLCBV2):
     """
-    Upgraded ExactNeuraLCBV2 with Tofu Loss (reward clipping) and Risk-Aware Action Selection.
-    This exactly implements the formula: argmax { rho(F) - L * R(pi) }
+    Phiên bản Risk-aware + Tofu Loss của Exact NeuraLCB.
+    Logic cập nhật: Sherman-Morrison tuần tự (Local) thay vì nghịch đảo ma trận Z tổng thể.
     """
     def __init__(self, hparams, update_freq=1, name='RiskExactNeuraLCBV2'):
+        # Khởi tạo ma trận Lambda_inv cục bộ (num_actions x p x p)
         super().__init__(hparams, update_freq, name)
-        # Shared confidence matrix for the entire dataset
-        p = self.nn.num_params
-        import numpy as np
-        self.Lambda_inv = jax.device_put(np.eye(p, dtype=np.float32) / float(hparams.lambd0))
-        self.historical_residuals = None
-        self.rho_residuals = None
-
-    def reset(self, seed):
-        """Reset network and the shared confidence matrix."""
-        p = self.nn.num_params
-        import numpy as np
-        self.Lambda_inv = jax.device_put(np.eye(p, dtype=np.float32) / float(self.hparams.lambd0))
-        self.nn.reset(seed)
-        self.data.reset()
         self.historical_residuals = None
         self.rho_residuals = None
 
@@ -1392,43 +1378,36 @@ class RiskExactNeuraLCBV2(ExactNeuraLCBV2):
         return 1.0
 
     def update(self, contexts, actions, rewards):
-        # 1. Tofu Loss: Clip rewards
-        tau_n = getattr(self.hparams, 'tau_n', 1e6)
+        # 1. Tofu Loss: Truncation rewards
+        tau_n = getattr(self.hparams, 'tau_n', 1.0)
         r_tilde = jnp.where(jnp.abs(rewards) <= tau_n, rewards, tau_n * jnp.sign(rewards))
 
-        self.data.add(contexts, actions, r_tilde)
+        self.data.add(contexts, actions.reshape(-1, 1), r_tilde.reshape(-1, 1))
         self.nn.train(self.data, self.hparams.num_steps)
 
-        # 2. Risk Estimation
+        # 2. Risk Estimation (Residuals)
         f_hist = self.nn.out(self.nn.params, contexts, actions).ravel()
         self.historical_residuals = rewards.ravel() - f_hist
         self.rho_residuals = self._compute_risk_functional(self.historical_residuals)
 
-        # 3. Update Shared Confidence Matrix
-        p = self.nn.num_params
-        import numpy as np
-        Z = jax.device_put(np.eye(p, dtype=np.float32) * float(self.hparams.lambd0))
+        # 3. Cập nhật Sherman-Morrison TUẦN TỰ cho từng mẫu dữ liệu
+        u = self.nn.grad_out(self.nn.params, contexts, actions) / jnp.sqrt(self.nn.m)
         
-        num_train = contexts.shape[0]
-        chunk_size = getattr(self.hparams, 'chunk_size', 500)
-        
-        for i in range(0, num_train, chunk_size):
-            end_idx = min(i + chunk_size, num_train)
-            g_chunk = self.nn.grad_out(self.nn.params, contexts[i:end_idx], actions[i:end_idx]) / jnp.sqrt(self.nn.m)
-            Z += g_chunk.T @ g_chunk
-            del g_chunk
-
-        self.Lambda_inv = jnp.linalg.inv(Z)
-        del Z
+        for i in range(contexts.shape[0]):
+            a = actions[i]
+            # Cập nhật ma trận nghịch đảo cục bộ cho hành động a bằng Sherman-Morrison
+            self.Lambda_inv = jax.ops.index_update(
+                self.Lambda_inv, a, 
+                inv_sherman_morrison_single_sample(u[i,:], self.Lambda_inv[a,:,:])
+            )
 
     def train_offline_batch(self, contexts, actions, rewards):
-        """Offline training wrapper for compatibility."""
-        # RiskExactNeuraLCBV2.update already adds to data, but we reset here to be clean
+        """Wrapper huấn luyện offline cho compatibility."""
         self.data.reset()
         self.update(contexts, actions, rewards)
 
     def sample_action(self, contexts):
-        assert self.rho_residuals is not None, "Call update() first."
+        assert self.rho_residuals is not None, "Call update() before sample_action()."
         cs = getattr(self.hparams, 'chunk_size', 500)
         num_chunks = math.ceil(contexts.shape[0] / cs)
         acts = []
@@ -1439,24 +1418,18 @@ class RiskExactNeuraLCBV2(ExactNeuraLCBV2):
             lcb = []
             for a in range(self.hparams.num_actions):
                 actions_tmp = jnp.ones(shape=(ctxs.shape[0],)) * a 
-
                 f = self.nn.out(self.nn.params, ctxs, actions_tmp) 
                 g = self.nn.grad_out(self.nn.params, ctxs, actions_tmp) / jnp.sqrt(self.nn.m)
                 
-                gA = g @ self.Lambda_inv
+                # Tính độ bất định (uncertainty) bằng ma trận CỤC BỘ của hành động a
+                gA = g @ self.Lambda_inv[a,:,:]
                 gAg = jnp.sum(jnp.multiply(gA, g), axis=-1) 
                 cnf = jnp.sqrt(gAg) 
 
-                # ========================================================
-                # TRANSITION FROM MEAN TO RISK-AWARE: rho(F) - L * R(pi)
-                # ========================================================
-                # 1. Calculate risk of the predicted distribution (Translation Invariance)
+                # Công thức Risk-aware LCB: rho(F) - beta * L * R
                 risk_a = f.ravel() + self.rho_residuals
-                
-                # 2. Calculate scaled uncertainty penalty (Lipschitz bounded)
                 penalty = self.hparams.beta * L_rho * cnf.ravel()
                 
-                # 3. Final Risk-Aware LCB
                 lcb_a = risk_a - penalty
                 lcb.append(lcb_a.reshape(-1,1)) 
                 
@@ -1505,7 +1478,7 @@ class RiskExactNeuraLCBV2(ExactNeuraLCBV2):
                 # Uncertainty
                 g = self.nn.grad_out(self.nn.params, batch_contexts, actions_tmp) / jnp.sqrt(self.nn.m)
                 
-                gA = g @ self.Lambda_inv
+                gA = g @ self.Lambda_inv[a,:,:]
                 gAg = jnp.sum(jnp.multiply(gA, g), axis=-1)
                 R_a = jnp.sqrt(gAg)
                 
