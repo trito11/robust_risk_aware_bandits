@@ -678,35 +678,54 @@ class RobustOfflineBatchNeuraLCB(BanditAlgorithm):
         self.historical_residuals = rewards.ravel() - f_hist
 
         # Step 4: Exact Covariance Matrix Z
-        # Use chunked updates to stay within 8GB RAM for large parameter spaces
+        # We perform these calculations on CPU to prevent GPU OOM for large parameter spaces.
+        # p=70k requires ~20GB RAM for Z.
         p = self.nn.num_params
-        Z = self.hparams.lambd0 * jnp.eye(p)
+        import numpy as np
+        
+        if self.hparams.verbose:
+            print(f'[{self.name}] Initializing Z matrix on CPU (p={p}, size~{p*p*4/(1024**3):.2f} GB)...')
+        
+        # Initialize Z on CPU as a numpy array
+        Z_cpu = np.eye(p, dtype=np.float32) * float(self.hparams.lambd0)
         
         num_train = contexts.shape[0]
         z_chunk_size = getattr(self.hparams, 'chunk_size', 500)
         
         if self.hparams.verbose:
-            print(f'[{self.name}] Computing Z matrix in chunks (p={p})...')
-            pbar = tqdm(total=num_train, desc="Computing Z Matrix", unit="samples")
+            pbar = tqdm(total=num_train, desc="Computing Z Matrix (CPU)", unit="samples")
 
         for i in range(0, num_train, z_chunk_size):
             end_idx = min(i + z_chunk_size, num_train)
+            # Calculate gradient chunk on GPU
             g_chunk = self.nn.grad_out(self.nn.params, contexts[i:end_idx], actions[i:end_idx]) / jnp.sqrt(self.nn.m)
-            Z = Z + g_chunk.T @ g_chunk
-            # Force deletion to help memory?
-            del g_chunk
+            
+            # Move only the small gradient chunk to CPU and update Z
+            g_chunk_cpu = np.array(jax.device_get(g_chunk))
+            Z_cpu += g_chunk_cpu.T @ g_chunk_cpu
+            
+            del g_chunk, g_chunk_cpu
             if self.hparams.verbose:
                 pbar.update(end_idx - i)
 
         if self.hparams.verbose:
             pbar.close()
+            print(f'[{self.name}] Inverting Z matrix on CPU...')
 
-        # Invert on CPU using numpy to prevent JAX OOM on large matrices (e.g. 20k x 20k)
-        Z_cpu = jax.device_get(Z)
-        import numpy as np
+        # Invert on CPU using numpy
         Z_inv_cpu = np.linalg.inv(Z_cpu)
-        self.Z_inv = jax.device_put(Z_inv_cpu)
-        del Z, Z_cpu, Z_inv_cpu # Free memory immediately after inversion
+        
+        # Store Z_inv. If it's too big, keep it on CPU for evaluations as well.
+        if p > 30000: # Threshold for keeping on CPU (approx 3.6GB)
+            self.Z_inv = Z_inv_cpu 
+            self.Z_inv_on_cpu = True
+            if self.hparams.verbose:
+                print(f'[{self.name}] Z_inv is large, keeping on CPU.')
+        else:
+            self.Z_inv = jax.device_put(Z_inv_cpu)
+            self.Z_inv_on_cpu = False
+            
+        del Z_cpu, Z_inv_cpu # Free memory immediately
 
         # Step 5: Residual Risk for Translation Invariance
         # Use Translation Invariance Property: rho(mu + residual) = mu + rho(residual)
@@ -752,7 +771,14 @@ class RobustOfflineBatchNeuraLCB(BanditAlgorithm):
 
                 # Uncertainty Penalty (Pessimism)
                 g_test = self.nn.grad_out(self.nn.params, batch_contexts, actions_tmp) / jnp.sqrt(self.nn.m)
-                R_a = jnp.sqrt(jnp.sum((g_test @ self.Z_inv) * g_test, axis=-1))
+                
+                if getattr(self, 'Z_inv_on_cpu', False):
+                    # Compute on CPU if Z_inv is large
+                    g_test_cpu = np.array(jax.device_get(g_test))
+                    R_a_cpu = np.sqrt(np.sum((g_test_cpu @ self.Z_inv) * g_test_cpu, axis=-1))
+                    R_a = jnp.array(R_a_cpu)
+                else:
+                    R_a = jnp.sqrt(jnp.sum((g_test @ self.Z_inv) * g_test, axis=-1))
 
                 L_rho = self._get_risk_lipschitz_factor()
                 lcbs.append((rho_a - self.hparams.beta * L_rho * R_a).reshape(-1, 1))
@@ -814,7 +840,12 @@ class RobustOfflineBatchNeuraLCB(BanditAlgorithm):
                 
                 # Uncertainty
                 g_test = self.nn.grad_out(self.nn.params, batch_contexts, actions_tmp) / jnp.sqrt(self.nn.m)
-                R_a = jnp.sqrt(jnp.sum((g_test @ self.Z_inv) * g_test, axis=-1))
+                if getattr(self, 'Z_inv_on_cpu', False):
+                    g_test_cpu = np.array(jax.device_get(g_test))
+                    R_a_cpu = np.sqrt(np.sum((g_test_cpu @ self.Z_inv) * g_test_cpu, axis=-1))
+                    R_a = R_a_cpu
+                else:
+                    R_a = jnp.sqrt(jnp.sum((g_test @ self.Z_inv) * g_test, axis=-1))
                 
                 mu_a_full.append(np.array(mu_a))
                 R_a_full.append(np.array(R_a))
@@ -892,7 +923,12 @@ class RobustOfflineBatchNeuraLCB(BanditAlgorithm):
         
         # 2. Uncertainty Penalty
         g_test = self.nn.grad_out(self.nn.params, contexts, pi_actions) / jnp.sqrt(self.nn.m)
-        pointwise_R = jnp.sqrt(jnp.sum((g_test @ self.Z_inv) * g_test, axis=-1))
+        if getattr(self, 'Z_inv_on_cpu', False):
+            g_test_cpu = np.array(jax.device_get(g_test))
+            pointwise_R_cpu = np.sqrt(np.sum((g_test_cpu @ self.Z_inv) * g_test_cpu, axis=-1))
+            pointwise_R = jnp.array(pointwise_R_cpu)
+        else:
+            pointwise_R = jnp.sqrt(jnp.sum((g_test @ self.Z_inv) * g_test, axis=-1))
         
         mean_R_pi = jnp.mean(pointwise_R)
         L_rho = self._get_risk_lipschitz_factor()
@@ -1364,22 +1400,34 @@ class RiskExactNeuraLCBV2(ExactNeuraLCBV2):
         return 1.0
 
     def update(self, contexts, actions, rewards):
-        # 1. Tofu Loss: Clip rewards to tau_n to avoid outlier gradient explosions
+        # 1. Tofu Loss: Clip rewards
         tau_n = getattr(self.hparams, 'tau_n', 1e6)
         r_tilde = jnp.where(jnp.abs(rewards) <= tau_n, rewards, tau_n * jnp.sign(rewards))
 
         self.data.add(contexts, actions, r_tilde)
         self.nn.train(self.data, self.hparams.num_steps)
 
-        # 2. Risk Estimation: Calculate empirical residuals on RAW rewards
+        # 2. Risk Estimation
         f_hist = self.nn.out(self.nn.params, contexts, actions).ravel()
         self.historical_residuals = rewards.ravel() - f_hist
         self.rho_residuals = self._compute_risk_functional(self.historical_residuals)
 
-        # 3. Update Shared Confidence Matrix (Lambda_inv)
-        u = self.nn.grad_out(self.nn.params, contexts, actions) / jnp.sqrt(self.nn.m)
-        for i in range(contexts.shape[0]):
-            self.Lambda_inv = inv_sherman_morrison_single_sample(u[i,:], self.Lambda_inv)
+        # 3. Update Shared Confidence Matrix (Moved to CPU for memory stability)
+        p = self.nn.num_params
+        import numpy as np
+        Z = np.eye(p) * self.hparams.lambd0
+        
+        num_train = contexts.shape[0]
+        chunk_size = getattr(self.hparams, 'chunk_size', 500)
+        
+        for i in range(0, num_train, chunk_size):
+            end_idx = min(i + chunk_size, num_train)
+            g_chunk = jax.device_get(self.nn.grad_out(self.nn.params, contexts[i:end_idx], actions[i:end_idx]) / jnp.sqrt(self.nn.m))
+            Z += g_chunk.T @ g_chunk
+            del g_chunk
+
+        self.Lambda_inv = jax.device_put(np.linalg.inv(Z))
+        del Z
 
     def sample_action(self, contexts):
         assert self.rho_residuals is not None, "Call update() first."

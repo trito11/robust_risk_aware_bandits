@@ -1,9 +1,10 @@
 import subprocess
 import os
+import sys
 
-# 1. Danh sách cấu hình thực nghiệm
-ALGO_GROUPS = ["robust-offline", "risk-lin-lcb", "quantile-risk"]
-FUNCTION_TYPES = ["linear", "quadratic"]  # Bạn có thể thêm "linear", "quadratic2"
+# 1. Danh sách cấu hình thực nghiệm theo yêu cầu mới
+ALGO_GROUPS = ["risk-exact"]
+FUNCTION_TYPES = ["cosine"]
 N_VALUES = [100, 500, 1000, 5000, 10000, 20000, 50000]
 
 # 2. Cấu hình cố định
@@ -25,17 +26,11 @@ POLICY_TYPE = "risk-aware"
 # 3. Vòng lặp thực nghiệm
 for algo in ALGO_GROUPS:
     for func in FUNCTION_TYPES:
-        # Tinh chỉnh tham số dựa trên thuật toán
-        if algo == "quantile-risk":
-            BETA = 0.005
-            NUM_STEPS = 3000
-            LR = 5e-4
-            LAMBDA = 1e-3
-        else:
-            BETA = 0.1
-            NUM_STEPS = 1000
-            LR = 1e-3
-            LAMBDA = 1e-4
+        # Tinh chỉnh tham số cho Risk-Exact
+        BETA = 0.1
+        NUM_STEPS = 1000
+        LR = 1e-3
+        LAMBDA = 1e-4
 
         for n in N_VALUES:
             print(f"\n" + "="*60)
@@ -43,7 +38,7 @@ for algo in ALGO_GROUPS:
             print("="*60)
             
             cmd = [
-                "python", "realworld_main.py",
+                sys.executable, "realworld_main.py",
                 "--data_type", DATA_TYPE,
                 "--function_type", func,
                 "--noise_type", NOISE_TYPE,
@@ -69,4 +64,4 @@ for algo in ALGO_GROUPS:
             
             subprocess.run(cmd)
 
-print(f"\nToàn bộ thực nghiệm đã hoàn tất! Các kết quả NPZ đã nằm trong thư mục results.")
+print(f"\nThực nghiệm Risk-Exact trên hàm Cosine đã hoàn tất!")
