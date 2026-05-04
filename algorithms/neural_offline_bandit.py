@@ -1357,6 +1357,25 @@ class RiskExactNeuraLCBV2(ExactNeuraLCBV2):
         super().__init__(hparams, update_freq, name)
         self.historical_residuals = None
         self.rho_residuals = None
+        
+        # Bắt buộc khởi tạo nếu lớp cha bỏ qua do kích thước lớn
+        if self.Lambda_inv is None:
+            p = self.nn.num_params
+            k = hparams.num_actions
+            import numpy as np
+            self.Lambda_inv = jnp.array([np.eye(p, dtype=np.float32)/hparams.lambd0 for _ in range(k)])
+
+    def reset(self, seed):
+        """Khởi tạo lại mạng và ma trận hiệp phương sai."""
+        self.nn.reset(seed)
+        self.data.reset()
+        self.historical_residuals = None
+        self.rho_residuals = None
+        
+        p = self.nn.num_params
+        k = self.hparams.num_actions
+        import numpy as np
+        self.Lambda_inv = jnp.array([np.eye(p, dtype=np.float32)/self.hparams.lambd0 for _ in range(k)])
 
     def _compute_risk_functional(self, Y):
         measure = getattr(self.hparams, 'risk_measure', 'cvar')
