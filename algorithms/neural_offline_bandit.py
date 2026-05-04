@@ -103,6 +103,12 @@ class ExactNeuraLCBV2(BanditAlgorithm):
             jax.ops.index_update(self.Lambda_inv, actions[i], \
                 inv_sherman_morrison_single_sample(u[i,:], self.Lambda_inv[actions[i],:,:]))
 
+    def train_offline_batch(self, contexts, actions, rewards):
+        """Offline training wrapper for compatibility."""
+        self.data.reset()
+        self.data.add(contexts, actions.reshape(-1, 1), rewards.reshape(-1, 1))
+        self.update(contexts, actions, rewards)
+
     def monitor(self, contexts=None, actions=None, rewards=None):
         norm = jnp.hstack(( jnp.ravel(param) for param in jax.tree_util.tree_leaves(self.nn.params)))
 
@@ -1414,6 +1420,12 @@ class RiskExactNeuraLCBV2(ExactNeuraLCBV2):
 
         self.Lambda_inv = jnp.linalg.inv(Z)
         del Z
+
+    def train_offline_batch(self, contexts, actions, rewards):
+        """Offline training wrapper for compatibility."""
+        # RiskExactNeuraLCBV2.update already adds to data, but we reset here to be clean
+        self.data.reset()
+        self.update(contexts, actions, rewards)
 
     def sample_action(self, contexts):
         assert self.rho_residuals is not None, "Call update() first."
