@@ -1350,32 +1350,26 @@ class OfflineBatchNeuraLCB(BanditAlgorithm):
 class RiskExactNeuraLCBV2(ExactNeuraLCBV2):
     """
     Phiên bản Risk-aware + Tofu Loss của Exact NeuraLCB.
-    Logic cập nhật: Sherman-Morrison tuần tự (Local) thay vì nghịch đảo ma trận Z tổng thể.
+    Logic cập nhật: Sherman-Morrison tuần tự trên ma trận GLOBAL để tránh OOM.
     """
     def __init__(self, hparams, update_freq=1, name='RiskExactNeuraLCBV2'):
-        # Khởi tạo ma trận Lambda_inv cục bộ (num_actions x p x p)
         super().__init__(hparams, update_freq, name)
+        # Sử dụng ma trận GLOBAL (p x p) thay vì Local để tránh tốn 50GB RAM
+        p = self.nn.num_params
+        import numpy as np
+        self.Lambda_inv = jax.device_put(np.eye(p, dtype=np.float32) / float(hparams.lambd0))
         self.historical_residuals = None
         self.rho_residuals = None
-        
-        # Bắt buộc khởi tạo nếu lớp cha bỏ qua do kích thước lớn
-        if self.Lambda_inv is None:
-            p = self.nn.num_params
-            k = hparams.num_actions
-            import numpy as np
-            self.Lambda_inv = jnp.array([np.eye(p, dtype=np.float32)/hparams.lambd0 for _ in range(k)])
 
     def reset(self, seed):
         """Khởi tạo lại mạng và ma trận hiệp phương sai."""
         self.nn.reset(seed)
         self.data.reset()
+        p = self.nn.num_params
+        import numpy as np
+        self.Lambda_inv = jax.device_put(np.eye(p, dtype=np.float32) / float(self.hparams.lambd0))
         self.historical_residuals = None
         self.rho_residuals = None
-        
-        p = self.nn.num_params
-        k = self.hparams.num_actions
-        import numpy as np
-        self.Lambda_inv = jnp.array([np.eye(p, dtype=np.float32)/self.hparams.lambd0 for _ in range(k)])
 
     def _compute_risk_functional(self, Y):
         measure = getattr(self.hparams, 'risk_measure', 'cvar')
@@ -1409,15 +1403,12 @@ class RiskExactNeuraLCBV2(ExactNeuraLCBV2):
         self.historical_residuals = rewards.ravel() - f_hist
         self.rho_residuals = self._compute_risk_functional(self.historical_residuals)
 
-        # 3. Cập nhật Sherman-Morrison TUẦN TỰ cho từng mẫu dữ liệu
+        # 3. Cập nhật Sherman-Morrison TUẦN TỰ trên ma trận GLOBAL
         u = self.nn.grad_out(self.nn.params, contexts, actions) / jnp.sqrt(self.nn.m)
         
         for i in range(contexts.shape[0]):
-            a = actions[i]
-            # Cập nhật ma trận nghịch đảo cục bộ cho hành động a bằng Sherman-Morrison
-            self.Lambda_inv = self.Lambda_inv.at[a].set(
-                inv_sherman_morrison_single_sample(u[i,:], self.Lambda_inv[a,:,:])
-            )
+            # Cập nhật vào ma trận Global duy nhất
+            self.Lambda_inv = inv_sherman_morrison_single_sample(u[i,:], self.Lambda_inv)
 
     def train_offline_batch(self, contexts, actions, rewards):
         """Wrapper huấn luyện offline cho compatibility."""
@@ -1439,8 +1430,8 @@ class RiskExactNeuraLCBV2(ExactNeuraLCBV2):
                 f = self.nn.out(self.nn.params, ctxs, actions_tmp) 
                 g = self.nn.grad_out(self.nn.params, ctxs, actions_tmp) / jnp.sqrt(self.nn.m)
                 
-                # Tính độ bất định (uncertainty) bằng ma trận CỤC BỘ của hành động a
-                gA = g @ self.Lambda_inv[a,:,:]
+                # Sử dụng ma trận GLOBAL dùng chung
+                gA = g @ self.Lambda_inv
                 gAg = jnp.sum(jnp.multiply(gA, g), axis=-1) 
                 cnf = jnp.sqrt(gAg) 
 
