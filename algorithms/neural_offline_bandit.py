@@ -1391,12 +1391,21 @@ class RiskExactNeuraLCBV2(ExactNeuraLCBV2):
         super().__init__(hparams, update_freq, name)
         # Shared confidence matrix for the entire dataset
         p = self.nn.num_params
-        if p > 30000:
-            self.Lambda_inv = np.eye(p, dtype=np.float32) / float(hparams.lambd0)
-            self.Lambda_inv_on_cpu = True
-        else:
-            self.Lambda_inv = jnp.eye(p) / hparams.lambd0
-            self.Lambda_inv_on_cpu = False
+        self.Lambda_inv = None
+        self.Lambda_inv_on_cpu = False
+        
+        # Try to initialize Lambda_inv if p is reasonably small
+        if p <= 30000:
+            try:
+                self.Lambda_inv = jnp.eye(p) / hparams.lambd0
+                self.Lambda_inv_on_cpu = False
+            except Exception:
+                pass
+        
+        if self.Lambda_inv is None:
+            # For large p, we will initialize it in update() after training
+            if self.hparams.verbose:
+                print(f'[{self.name}] p={p} is large. Lambda_inv will be initialized on CPU after first update.')
             
         self.historical_residuals = None
         self.rho_residuals = None
@@ -1404,12 +1413,15 @@ class RiskExactNeuraLCBV2(ExactNeuraLCBV2):
     def reset(self, seed):
         """Reset network and the shared confidence matrix."""
         p = self.nn.num_params
-        if p > 30000:
-            self.Lambda_inv = np.eye(p, dtype=np.float32) / float(self.hparams.lambd0)
-            self.Lambda_inv_on_cpu = True
-        else:
-            self.Lambda_inv = jnp.eye(p) / self.hparams.lambd0
-            self.Lambda_inv_on_cpu = False
+        self.Lambda_inv = None
+        self.Lambda_inv_on_cpu = False
+        
+        if p <= 30000:
+            try:
+                self.Lambda_inv = jnp.eye(p) / self.hparams.lambd0
+                self.Lambda_inv_on_cpu = False
+            except Exception:
+                pass
             
         self.nn.reset(seed)
         self.data.reset()
