@@ -84,12 +84,11 @@ def create_eval_env(p_name, meal_size, current_time, seed):
     env.reset()
     return env
 
-def collect_simglucose_data(n_train=200, n_test=50, save_path='data/simglucose_test.npz', alpha=0.05):
+def collect_simglucose_data(n_train=1000, n_test=200, n_oracle_trials=10, save_path='data/simglucose_offline.npz', alpha=0.05):
     patient_names = ['child#001', 'child#002', 'adolescent#001', 'adult#001']
     samples_per_patient = (n_train + n_test) // len(patient_names)
     test_per_patient = n_test // len(patient_names)
-    n_oracle_trials = 2 # Reduced for faster testing
-
+    
     train_contexts, train_actions, train_rewards = [], [], []
     test_contexts, test_mean_matrix, test_cvar_matrix = [], [], []
 
@@ -122,7 +121,7 @@ def collect_simglucose_data(n_train=200, n_test=50, save_path='data/simglucose_t
                         if np.random.rand() < 0.3: bolus += np.random.uniform(-2, 2)
                         bolus = int(np.round(max(0, min(10, bolus))))
                         
-                        eval_env = create_eval_env(p_name, meal, master_env.time, p_idx + 100)
+                        eval_env = create_eval_env(p_name, meal, master_env.time, p_idx + 100 + patient_count)
                         sync_env_state(master_env, eval_env)
                         
                         bg_window = []
@@ -141,7 +140,7 @@ def collect_simglucose_data(n_train=200, n_test=50, save_path='data/simglucose_t
                         for a in range(11):
                             trial_rewards = []
                             for trial in range(n_oracle_trials):
-                                eval_env = create_eval_env(p_name, meal, master_env.time, p_idx + trial * 13)
+                                eval_env = create_eval_env(p_name, meal, master_env.time, p_idx + trial * 13 + patient_count)
                                 sync_env_state(master_env, eval_env)
                                 
                                 ctrl_action = controller.policy(state, reward, done, **info)
@@ -167,9 +166,14 @@ def collect_simglucose_data(n_train=200, n_test=50, save_path='data/simglucose_t
                     print(f"\n[WARNING] Simulation error for {p_name} at {master_env.time}: {e}")
                     pass 
 
-            master_action = controller.policy(state, reward, done, **info)
-            state, reward, done, info = master_env.step(master_action)
-            if done: 
+            # IMPORTANT: Advance master loop. Wrap in try-except to handle master ODE failures.
+            try:
+                master_action = controller.policy(state, reward, done, **info)
+                state, reward, done, info = master_env.step(master_action)
+                if done: 
+                    state, reward, done, info = master_env.reset()
+            except Exception as e:
+                print(f"\n[CRITICAL] Master env failure for {p_name}: {e}. Resetting...")
                 state, reward, done, info = master_env.reset()
         pbar.close()
 
@@ -182,6 +186,9 @@ def collect_simglucose_data(n_train=200, n_test=50, save_path='data/simglucose_t
              test_mean=np.array(test_mean_matrix),
              test_cvar=np.array(test_cvar_matrix))
     print(f"\nSuccess! Total samples: {len(train_contexts) + len(test_contexts)}")
+    print(f"Saved to: {save_path}")
 
 if __name__ == "__main__":
-    collect_simglucose_data()
+    # Generate 2000 training samples and 200 test samples
+    collect_simglucose_data(n_train=2000, n_test=200, n_oracle_trials=10)
+
