@@ -12,6 +12,13 @@ import os
 from tqdm import tqdm
 import multiprocessing as mp
 import time
+from collections import namedtuple
+import sys
+
+# Define a generic Action that works for SimGlucose environment step
+EnvAction = namedtuple('EnvAction', ['basal', 'bolus'])
+# Define the Action used by Scenario (only meal)
+from simglucose.simulation.scenario import Action as ScenarioAction
 
 def get_magni_reward(bg_history):
     if not bg_history: return -500.0
@@ -62,44 +69,81 @@ def sync_env_state(src_env, dst_env):
         dst_env.scenario.start_time = current_time
 
 class ManualMealScenario:
-    """A scenario that only triggers a single meal at start_time."""
+    """A scenario that triggers a single meal on the first step."""
     def __init__(self, start_time, meal_size):
         self.start_time = start_time
         self.meal_size = meal_size
+        self.meal_sent = False
     def get_action(self, t):
-        if t == self.start_time:
-            return Action(insulin=0, meal=self.meal_size)
-        return Action(insulin=0, meal=0)
+        # Deliver meal on the very first request
+        if not self.meal_sent:
+            self.meal_sent = True
+            return ScenarioAction(meal=self.meal_size)
+        return ScenarioAction(meal=0)
     def reset(self):
-        pass
+        self.meal_sent = False
 
 def single_sim_eval(p_name, meal, current_time, state_y, sensor_last_state, bolus, seed):
     """Helper to run a single simulation trace and return reward."""
     patient = T1DPatient.withName(p_name)
     sensor = CGMSensor.withName('Dexcom', seed=seed)
     pump = InsulinPump.withName('Insulet')
+    # Scenario should NOT provide the meal if we pass it manually in env.step at the first step
+    # Or better: let scenario handle the meal and we only pass insulin.
     scenario = ManualMealScenario(current_time, meal)
     env = T1DSimEnv(patient, sensor, pump, scenario)
     env.reset()
     
-    if hasattr(env.patient, '_state'): env.patient._state = state_y.copy()
-    elif hasattr(env.patient, '_y'): env.patient._y = state_y.copy()
+    # Sync time and state carefully
+    
+    
+    # Inject state via protected attributes only if they are not read-only
+    for attr in ['_state', '_y', 'y']:
+        if hasattr(env.patient, attr):
+            try:
+                setattr(env.patient, attr, state_y.copy())
+            except: pass
+        
+    if hasattr(env.patient, '_odesolver'):
+        try:
+            # Re-initialize solver with the correct state and relative time 0
+            env.patient._odesolver.set_initial_value(state_y.copy(), 0)
+        except:
+            try:
+                env.patient._odesolver._y = state_y.copy()
+                env.patient._odesolver.t = 0
+            except: pass
+            
     if sensor_last_state is not None:
         env.sensor.last_state = sensor_last_state
-    try:
-        env.patient._odesolver._y = state_y.copy()
-    except: pass
     
-    env.time = current_time
-    env.scenario.start_time = current_time
+    # Force patient BG state into CGM sensor to avoid delay-induced crashes at start
+    if hasattr(env.sensor, 'last_state'):
+        # SimGlucose CGM sensor stores the last BG value to simulate delay
+        # state_y[0] is usually the blood glucose (G) in Magni model
+        env.sensor.last_state = state_y[0]
     
     bg_window = []
-    current_act = Action(insulin=bolus, meal=meal)
+    # Use positional arguments for EnvAction (basal, bolus)
+    # The meal is handled by ManualMealScenario.get_action(current_time)
+    current_act = EnvAction(0, bolus) 
+    
     for i in range(180):
-        s, _, _, _ = env.step(current_act)
-        bg_window.append(s.CGM)
-        current_act = Action(insulin=0, meal=0)
+        try:
+            s, _, _, _ = env.step(current_act)
+            if s is None or not hasattr(s, 'CGM') or np.isnan(s.CGM):
+                break
+            bg_window.append(s.CGM)
+        except Exception as e:
+            # print(f"Simulation step error: {e}")
+            break
+        current_act = EnvAction(0, 0)
+    
     return get_magni_reward(bg_window)
+
+def log_error(msg):
+    with open("simglucose_error.log", "a") as f:
+        f.write(f"{datetime.now()} - {msg}\n")
 
 def eval_sim_worker(p_name, meal, current_time, state_y, sensor_last_state, bolus_list, seed_base, queue):
     """Worker function to run one or more simulations."""
@@ -109,11 +153,16 @@ def eval_sim_worker(p_name, meal, current_time, state_y, sensor_last_state, bolu
             try:
                 res = single_sim_eval(p_name, meal, current_time, state_y, sensor_last_state, bolus, seed_base + i)
                 results.append(res)
-            except Exception:
-                # Individual trial failed, use default low reward
+            except Exception as e:
+                import traceback
+                err_msg = f"Error in single_sim_eval for {p_name} bolus {bolus}: {e}\n{traceback.format_exc()}"
+                log_error(err_msg)
                 results.append(-500.0)
         queue.put(("SUCCESS", results))
     except Exception as e:
+        import traceback
+        err_msg = f"Fatal error in eval_sim_worker for {p_name}: {e}\n{traceback.format_exc()}"
+        log_error(err_msg)
         queue.put(("ERROR", str(e)))
 
 def collect_simglucose_data(n_train=2000, n_test=200, n_oracle_trials=10, save_path='data/simglucose_offline.npz', alpha=0.05):
@@ -169,7 +218,7 @@ def collect_simglucose_data(n_train=2000, n_test=200, n_oracle_trials=10, save_p
                         queue = mp.Queue()
                         p = mp.Process(target=eval_sim_worker, args=(p_name, meal, master_env.time, state_y, sensor_state, [bolus], p_idx + 100 + patient_count, queue))
                         p.start()
-                        p.join(timeout=25)
+                        p.join(timeout=40)
                         
                         if p.is_alive():
                             p.terminate()
@@ -252,5 +301,6 @@ def collect_simglucose_data(n_train=2000, n_test=200, n_oracle_trials=10, save_p
     print(f"Saved to: {save_path}")
 
 if __name__ == "__main__":
-    collect_simglucose_data(n_train=2000, n_test=200, n_oracle_trials=10)
+    # Increased sample size for a more robust dataset
+    collect_simglucose_data(n_train=5000, n_test=1000, n_oracle_trials=20)
 
