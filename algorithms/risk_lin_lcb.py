@@ -48,9 +48,13 @@ class RiskLinLCB(BanditAlgorithm):
 
     def train_offline_batch(self, contexts, actions, rewards):
         """Train Linear LCB on offline batch using Tofu loss and estimate risk."""
-        # 1. Tofu Loss: Clip rewards
-        tau_n = getattr(self.hparams, 'tau_n', 1.0)
-        r_tilde = jnp.where(jnp.abs(rewards) <= tau_n, rewards, tau_n * jnp.sign(rewards))
+        # 1. Truncation / Tofu Loss
+        truncation_mode = getattr(self.hparams, 'truncation_mode', 'none')
+        if truncation_mode == 'clip':
+            tau_n = getattr(self.hparams, 'tau_n', 1.0)
+            r_tilde = jnp.where(jnp.abs(rewards) <= tau_n, rewards, tau_n * jnp.sign(rewards))
+        else:
+            r_tilde = rewards
         
         # 2. Build feature matrix phi (N, d*K)
         # Row-wise kronecker product of context and one-hot action

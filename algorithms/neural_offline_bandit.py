@@ -1395,9 +1395,13 @@ class RiskExactNeuraLCBV2(ExactNeuraLCBV2):
         return 1.0
 
     def update(self, contexts, actions, rewards):
-        # 1. Tofu Loss: Truncation rewards
-        tau_n = getattr(self.hparams, 'tau_n', 1.0)
-        r_tilde = jnp.where(jnp.abs(rewards) <= tau_n, rewards, tau_n * jnp.sign(rewards))
+        # 1. Truncation / Tofu Loss
+        truncation_mode = getattr(self.hparams, 'truncation_mode', 'none')
+        if truncation_mode == 'clip':
+            tau_n = getattr(self.hparams, 'tau_n', 1.0)
+            r_tilde = jnp.where(jnp.abs(rewards) <= tau_n, rewards, tau_n * jnp.sign(rewards))
+        else:
+            r_tilde = rewards
 
         self.data.add(contexts, actions.reshape(-1, 1), r_tilde.reshape(-1, 1))
         self.nn.train(self.data, self.hparams.num_steps)
