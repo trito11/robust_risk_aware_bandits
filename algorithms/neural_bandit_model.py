@@ -198,6 +198,7 @@ class NeuralBanditModelV2(NeuralBanditModel):
         self.out = jax.jit(self.out_impure_fn) 
         self.grad_out = jax.jit(self.grad_out_impure_fn)
         self.action_convolution = jax.jit(self.action_convolution_impure_fn)
+        self.phi_and_out = jax.jit(hk.without_apply_rng(hk.transform(self.phi_and_out_impure_fn)).apply)
         self.loss = jax.jit(self.loss_impure_fn)
         self.update = jax.jit(self.update_impure_fn)
 
@@ -210,30 +211,24 @@ class NeuralBanditModelV2(NeuralBanditModel):
         self.init(seed)
 
     def net_impure_fn(self, contexts, actions):
-        """
-        Args:
-            convoluted_contexts: (None, self.hparams.context_dim * num_actions)
-        """
-        net_structure = []
-        for num_units in self.hparams.layer_sizes:
-            net_structure.append(
-                hk.Linear(
-                    num_units, w_init=hk.initializers.UniformScaling(self.hparams.s_init) 
-                    )
-                ) 
-            if self.hparams.layer_n: 
-                net_structure.append(hk.LayerNorm(axis=1, create_scale=True, create_offset=True))
+        """Returns only the scalar reward prediction."""
+        phi, out = self.phi_and_out_impure_fn(contexts, actions)
+        return out
 
-            net_structure.append(self.hparams.activation) 
-
-        net_structure.append(
-                hk.Linear(1, w_init=hk.initializers.UniformScaling(self.hparams.s_init) )
-            )
+    def phi_and_out_impure_fn(self, contexts, actions):
+        """Returns both last layer features (phi) and the prediction."""
+        convoluted_contexts = self.action_convolution_impure_fn(contexts, actions)
         
-        mlp = hk.Sequential(net_structure) 
-
-        convoluted_contexts = self.action_convolution(contexts, actions)
-        return mlp(convoluted_contexts)
+        x = convoluted_contexts
+        for i, num_units in enumerate(self.hparams.layer_sizes):
+            x = hk.Linear(num_units, name=f"layer_{i}")(x)
+            if self.hparams.layer_n:
+                x = hk.LayerNorm(axis=1, create_scale=True, create_offset=True)(x)
+            x = self.hparams.activation(x)
+        
+        phi = x # Last hidden layer
+        out = hk.Linear(1, name="output_layer")(phi)
+        return phi, out
 
     def out_impure_fn(self, params, contexts, actions):
         return self.nn.apply(params, contexts, actions)

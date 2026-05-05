@@ -1349,25 +1349,29 @@ class OfflineBatchNeuraLCB(BanditAlgorithm):
 
 class RiskExactNeuraLCBV2(ExactNeuraLCBV2):
     """
-    Phiên bản Risk-aware + Tofu Loss của Exact NeuraLCB.
-    Logic cập nhật: Sherman-Morrison tuần tự trên ma trận GLOBAL để tránh OOM.
+    Phiên bản Risk-aware + Tofu Loss.
+    Đã tối ưu OOM bằng cách sử dụng Neural-Linear (chỉ tính trên lớp cuối d x d),
+    nhưng vẫn giữ đúng ý tưởng gốc là MỖI HÀNH ĐỘNG CÓ MA TRẬN RIÊNG (Local).
     """
     def __init__(self, hparams, update_freq=1, name='RiskExactNeuraLCBV2'):
         super().__init__(hparams, update_freq, name)
-        # Sử dụng ma trận GLOBAL (p x p) thay vì Local để tránh tốn 50GB RAM
-        p = self.nn.num_params
-        import numpy as np
-        self.Lambda_inv = jax.device_put(np.eye(p, dtype=np.float32) / float(hparams.lambd0))
+        self.d = hparams.layer_sizes[-1] # Số chiều lớp ẩn cuối
+        self.k = hparams.num_actions
+        
+        # Ma trận Local (k x d x d) - Rất nhẹ, tránh OOM tuyệt đối
+        self.Lambda_inv = jax.device_put(jnp.array(
+            [jnp.eye(self.d, dtype=jnp.float32) / float(hparams.lambd0) for _ in range(self.k)]
+        ))
         self.historical_residuals = None
         self.rho_residuals = None
 
     def reset(self, seed):
-        """Khởi tạo lại mạng và ma trận hiệp phương sai."""
+        """Khởi tạo lại mạng và các ma trận local."""
         self.nn.reset(seed)
         self.data.reset()
-        p = self.nn.num_params
-        import numpy as np
-        self.Lambda_inv = jax.device_put(np.eye(p, dtype=np.float32) / float(self.hparams.lambd0))
+        self.Lambda_inv = jax.device_put(jnp.array(
+            [jnp.eye(self.d, dtype=jnp.float32) / float(self.hparams.lambd0) for _ in range(self.k)]
+        ))
         self.historical_residuals = None
         self.rho_residuals = None
 
@@ -1403,23 +1407,18 @@ class RiskExactNeuraLCBV2(ExactNeuraLCBV2):
         self.historical_residuals = rewards.ravel() - f_hist
         self.rho_residuals = self._compute_risk_functional(self.historical_residuals)
 
-        # 3. Cập nhật Sherman-Morrison TUẦN TỰ trên ma trận GLOBAL (Tối ưu Chunked để tránh OOM)
-        num_train = contexts.shape[0]
-        update_chunk_size = getattr(self.hparams, 'update_chunk_size', 100)
+        # 3. Cập nhật Sherman-Morrison trên ma trận LOCAL của từng hành động
+        phi, _ = self.nn.phi_and_out(self.nn.params, contexts, actions) # (N, d)
         
-        def body_fn(A_inv, ui):
-            new_A_inv = inv_sherman_morrison_single_sample(ui, A_inv)
-            return new_A_inv, None
-
-        for i in range(0, num_train, update_chunk_size):
-            end_idx = min(i + update_chunk_size, num_train)
-            # Tính Gradient cho lô nhỏ
-            u_batch = self.nn.grad_out(self.nn.params, contexts[i:end_idx], actions[i:end_idx]) / jnp.sqrt(self.nn.m)
-            # Cập nhật tuần tự trên GPU cho lô này
-            self.Lambda_inv, _ = jax.lax.scan(body_fn, self.Lambda_inv, u_batch)
+        for i in range(contexts.shape[0]):
+            a = int(actions[i])
+            # Chỉ cập nhật ma trận của hành động a tương ứng với mẫu i
+            self.Lambda_inv = self.Lambda_inv.at[a].set(
+                inv_sherman_morrison_single_sample(phi[i, :], self.Lambda_inv[a])
+            )
 
     def train_offline_batch(self, contexts, actions, rewards):
-        """Wrapper huấn luyện offline cho compatibility."""
+        """Wrapper huấn luyện offline."""
         self.data.reset()
         self.update(contexts, actions, rewards)
 
@@ -1433,18 +1432,17 @@ class RiskExactNeuraLCBV2(ExactNeuraLCBV2):
         for i in range(num_chunks):
             ctxs = contexts[i * cs: (i+1) * cs,:] 
             lcb = []
-            for a in range(self.hparams.num_actions):
+            for a in range(self.k):
                 actions_tmp = jnp.ones(shape=(ctxs.shape[0],)) * a 
-                f = self.nn.out(self.nn.params, ctxs, actions_tmp) 
-                g = self.nn.grad_out(self.nn.params, ctxs, actions_tmp) / jnp.sqrt(self.nn.m)
+                phi_a, f_a = self.nn.phi_and_out(self.nn.params, ctxs, actions_tmp)
                 
-                # Sử dụng ma trận GLOBAL dùng chung
-                gA = g @ self.Lambda_inv
-                gAg = jnp.sum(jnp.multiply(gA, g), axis=-1) 
-                cnf = jnp.sqrt(gAg) 
+                # Sử dụng ma trận Local riêng cho hành động a
+                phi_A = phi_a @ self.Lambda_inv[a]
+                phi_A_phi = jnp.sum(jnp.multiply(phi_A, phi_a), axis=-1) 
+                cnf = jnp.sqrt(phi_A_phi) 
 
-                # Công thức Risk-aware LCB: rho(F) - beta * L * R
-                risk_a = f.ravel() + self.rho_residuals
+                # Công thức Risk-aware LCB
+                risk_a = f_a.ravel() + self.rho_residuals
                 penalty = self.hparams.beta * L_rho * cnf.ravel()
                 
                 lcb_a = risk_a - penalty
@@ -1489,19 +1487,18 @@ class RiskExactNeuraLCBV2(ExactNeuraLCBV2):
                 B = batch_contexts.shape[0]
                 actions_tmp = jnp.ones(shape=(B,)) * a
                 
-                # Mean Prediction
-                mu_a = self.nn.out(self.nn.params, batch_contexts, actions_tmp).ravel()
+                # Trích xuất đặc trưng và dự báo
+                phi_a, f_a = self.nn.phi_and_out(self.nn.params, batch_contexts, actions_tmp)
+                mu_a = f_a.ravel()
                 
-                # Uncertainty
-                g = self.nn.grad_out(self.nn.params, batch_contexts, actions_tmp) / jnp.sqrt(self.nn.m)
-                
-                gA = g @ self.Lambda_inv[a,:,:]
-                gAg = jnp.sum(jnp.multiply(gA, g), axis=-1)
-                R_a = jnp.sqrt(gAg)
+                # Tính độ bất định R_a dựa trên ma trận Local
+                phi_A = phi_a @ self.Lambda_inv[a]
+                phi_A_phi = jnp.sum(jnp.multiply(phi_A, phi_a), axis=-1)
+                R_a = jnp.sqrt(phi_A_phi)
                 
                 mu_a_full.append(np.array(mu_a))
                 R_a_full.append(np.array(R_a))
-                
+            
             mu_matrix[:, a] = np.concatenate(mu_a_full)
             R_matrix[:, a] = np.concatenate(R_a_full)
             
