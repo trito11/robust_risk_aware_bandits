@@ -116,41 +116,65 @@ def collect_simglucose_data(n_train=1000, n_test=200, n_oracle_trials=10, save_p
                 try:
                     if not is_test:
                         # --- Collect Train Data ---
+                        # Safety check: if BG is too low, don't explore large boluses
+                        if state.CGM < 70:
+                            patient_count += 1 # Skip but count or just continue
+                            continue
+
                         ctrl_action = controller.policy(state, reward, done, **info)
                         bolus = ctrl_action.bolus
-                        if np.random.rand() < 0.3: bolus += np.random.uniform(-2, 2)
-                        bolus = int(np.round(max(0, min(10, bolus))))
+                        
+                        # Limit bolus for children to prevent ODE failures
+                        max_bolus = 3 if 'child' in p_name else 10
+                        if np.random.rand() < 0.3: 
+                            noise = np.random.uniform(-1, 1) if 'child' in p_name else np.random.uniform(-2, 2)
+                            bolus += noise
+                        bolus = int(np.round(max(0, min(max_bolus, bolus))))
                         
                         eval_env = create_eval_env(p_name, meal, master_env.time, p_idx + 100 + patient_count)
                         sync_env_state(master_env, eval_env)
                         
                         bg_window = []
                         act = ctrl_action._replace(bolus=bolus)
-                        for _ in range(180): # 3 hours
-                            s, _, _, _ = eval_env.step(act)
-                            bg_window.append(s.CGM)
-                            act = ctrl_action._replace(bolus=0)
-                        
-                        train_contexts.append(ctx)
-                        train_actions.append(bolus)
-                        train_rewards.append(get_magni_reward(bg_window))
+                        try:
+                            for _ in range(180): # 3 hours
+                                s, _, _, _ = eval_env.step(act)
+                                bg_window.append(s.CGM)
+                                act = ctrl_action._replace(bolus=0)
+                            
+                            train_contexts.append(ctx)
+                            train_actions.append(bolus)
+                            train_rewards.append(get_magni_reward(bg_window))
+                        except Exception as e:
+                            # If individual simulation fails, just log and continue
+                            pass
                     else:
                         # --- Collect Test Data (Oracle with True CVaR) ---
+                        if state.CGM < 70:
+                            continue # Skip low BG states for test to ensure stability
+
                         action_means, action_cvars = [], []
                         for a in range(11):
+                            # Scale test action if it's a child
+                            actual_a = a if 'child' not in p_name else min(a, 3)
+                            
                             trial_rewards = []
                             for trial in range(n_oracle_trials):
                                 eval_env = create_eval_env(p_name, meal, master_env.time, p_idx + trial * 13 + patient_count)
                                 sync_env_state(master_env, eval_env)
                                 
                                 ctrl_action = controller.policy(state, reward, done, **info)
-                                act = ctrl_action._replace(bolus=a)
+                                act = ctrl_action._replace(bolus=actual_a)
                                 bg_window = []
-                                for _ in range(180):
-                                    s, _, _, _ = eval_env.step(act)
-                                    bg_window.append(s.CGM)
-                                    act = ctrl_action._replace(bolus=0)
-                                trial_rewards.append(get_magni_reward(bg_window))
+                                try:
+                                    for _ in range(180):
+                                        s, _, _, _ = eval_env.step(act)
+                                        bg_window.append(s.CGM)
+                                        act = ctrl_action._replace(bolus=0)
+                                    trial_rewards.append(get_magni_reward(bg_window))
+                                except Exception:
+                                    # Fallback reward for failed simulations
+                                    trial_rewards.append(-500.0)
                             
                             action_means.append(np.mean(trial_rewards))
                             sorted_rew = np.sort(trial_rewards)
