@@ -166,7 +166,7 @@ def eval_sim_worker(p_name, meal, current_time, state_y, sensor_last_state, bolu
         queue.put(("ERROR", str(e)))
 
 def collect_simglucose_data(n_train=2000, n_test=200, n_oracle_trials=10, save_path='data/simglucose_offline.npz', alpha=0.05):
-    patient_names = ['child#001', 'child#002', 'adolescent#001', 'adult#001']
+    patient_names = ['adolescent#001', 'adult#001','child#001', 'child#002']
     samples_per_patient = (n_train + n_test) // len(patient_names)
     test_per_patient = n_test // len(patient_names)
     
@@ -332,5 +332,5 @@ def collect_simglucose_data(n_train=2000, n_test=200, n_oracle_trials=10, save_p
 
 if __name__ == "__main__":
     # Increased sample size for a more robust dataset
-    collect_simglucose_data(n_train=2000, n_test=400, n_oracle_trials=20)
+    collect_simglucose_data(n_train=2000, n_test=400, n_oracle_trials=10)
 
