@@ -363,6 +363,9 @@ def main(unused_argv):
             oracle_mean = np.mean(opt_vals_full)
             oracle_var  = np.var(opt_vals_full)
             oracle_noise = None
+            
+            # --- Oracle Mean (For Standard Regret) ---
+            mean_opt_vals_full = np.max(test_mean_full, axis=1)
 
         for sim in range(FLAGS.num_sim):
             print(f'Simulation: {sim + 1}/{FLAGS.num_sim}')
