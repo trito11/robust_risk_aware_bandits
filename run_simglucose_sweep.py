@@ -9,11 +9,12 @@ NUM_ACTIONS = 11
 NUM_SIM = 10        # Number of simulations per N
 LAYER_SIZES = "32,32"  
 DATA_PATH = "data/simglucose_2patients.npz"
+NUM_TEST = 500    
 
 # Algorithm parameters from run_robust_sweep.py
 RISK_MEASURE = "cvar"
 ALPHA = 0.05
-TAU_N = 1.0
+TAU_N = 500.0       # Increased for Simglucose rewards (range -500 to 0)
 LAMBDA0 = 10.0
 POLICY_TYPE = "risk-aware"
 AGENT_EVAL_METHOD = "local"
@@ -52,7 +53,7 @@ for algo in ALGO_GROUPS:
         NUM_STEPS = 1000
         LR = 1e-3
         LAMBDA = 1e-4
-        TRUNC_MODE = "clip" # Only robust-offline uses clip
+        TRUNC_MODE = "none" # Set to none by default for Simglucose, or use large TAU_N
     else:
         BETA = 0.1
         NUM_STEPS = 1000
@@ -86,7 +87,8 @@ for algo in ALGO_GROUPS:
             "--truncation_mode", TRUNC_MODE,
             "--agent_eval_method", AGENT_EVAL_METHOD,
             "--oracle_eval_method", ORACLE_EVAL_METHOD,
-            "--nouse_wandb"
+            "--nouse_wandb",
+            "--num_steps", str(NUM_STEPS),
         ]
         
         try:
