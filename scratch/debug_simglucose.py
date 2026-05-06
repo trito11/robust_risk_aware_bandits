@@ -5,7 +5,7 @@ from simglucose.sensor.cgm import CGMSensor
 from simglucose.actuator.pump import InsulinPump
 from simglucose.simulation.scenario import Action
 from datetime import datetime
-from data.simglucose_offline_gen import ManualMealScenario, get_magni_reward
+from data.meta.simglucose_offline_gen import ManualMealScenario, get_magni_reward
 
 def test_single_eval():
     p_name = 'adolescent#001'

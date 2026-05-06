@@ -57,4 +57,6 @@ def verify_dataset(path='data/simglucose_offline.npz'):
     print("\n" + "="*50)
 
 if __name__ == "__main__":
-    verify_dataset()
+    import sys
+    path = sys.argv[1] if len(sys.argv) > 1 else 'data/simglucose_offline.npz'
+    verify_dataset(path)
