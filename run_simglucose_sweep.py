@@ -14,7 +14,7 @@ NUM_TEST = 500
 # Algorithm parameters from run_robust_sweep.py
 RISK_MEASURE = "cvar"
 ALPHA = 0.05
-TAU_N = 500.0       # Increased for Simglucose rewards (range -500 to 0)
+TAU_N = 150.0       # Adjusted to clip extreme outliers while preserving normal Simglucose range
 LAMBDA0 = 10.0
 POLICY_TYPE = "risk-aware"
 AGENT_EVAL_METHOD = "local"
@@ -30,36 +30,29 @@ ALGO_GROUPS = [
 ]
 
 # Sweep over num_contexts (N)
-N_VALUES = [100, 200, 500, 1000]
-
-# Prepare data file (Symlink or copy to the expected location)
-if os.path.exists("data/simglucose_offline.npz") and not os.path.exists("data/simglucose_offline_backup_full.npz"):
-    os.rename("data/simglucose_offline.npz", "data/simglucose_offline_backup_full.npz")
-
-if os.path.exists(DATA_PATH):
-    shutil.copy(DATA_PATH, "data/simglucose_offline.npz")
+N_VALUES = [50, 100, 200, 400]
 
 # 2. Experimental Loop
 for algo in ALGO_GROUPS:
     # Fine-tune parameters based on algorithm
     if algo == "quantile-risk":
-        BETA = 0.005
+        BETA = 0.01      # Increased slightly for stability
         NUM_STEPS = 3000
         LR = 5e-4
         LAMBDA = 1e-3
         TRUNC_MODE = "none"
     elif algo == "robust-offline":
-        BETA = 0.1
-        NUM_STEPS = 1000
+        BETA = 0.5       # Increased for more pessimism with small data
+        NUM_STEPS = 2000 # Increased training steps
         LR = 1e-3
         LAMBDA = 1e-4
-        TRUNC_MODE = "none" # Set to none by default for Simglucose, or use large TAU_N
+        TRUNC_MODE = "clip" # Re-enabled for heavy-tail robustness
     else:
-        BETA = 0.1
-        NUM_STEPS = 1000
+        BETA = 0.5       # Standard Neural LCB also uses 0.5
+        NUM_STEPS = 2000
         LR = 1e-3
         LAMBDA = 1e-4
-        TRUNC_MODE = "none" # risk-exact, risk-lin-lcb, neural-regression use none
+        TRUNC_MODE = "none"
 
     for n in N_VALUES:
         print(f"\n" + "="*60)
