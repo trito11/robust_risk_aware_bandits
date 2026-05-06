@@ -166,7 +166,7 @@ def eval_sim_worker(p_name, meal, current_time, state_y, sensor_last_state, bolu
         queue.put(("ERROR", str(e)))
 
 def collect_simglucose_data(n_train=2000, n_test=200, n_oracle_trials=10, save_path='data/simglucose_offline.npz', alpha=0.05):
-    patient_names = ['adolescent#001', 'adult#001','child#001', 'child#002']
+    patient_names = ['child#001', 'child#002', 'adolescent#001', 'adult#001']
     samples_per_patient = (n_train + n_test) // len(patient_names)
     test_per_patient = n_test // len(patient_names)
     
@@ -204,6 +204,11 @@ def collect_simglucose_data(n_train=2000, n_test=200, n_oracle_trials=10, save_p
         existing_test = sum(1 for c in test_contexts if c[2] == float(p_idx))
         patient_count = existing_train + existing_test
         
+        # Prioritize adolescent and adult for this run
+        if p_name in ['adult#001', 'child#002']:
+            print(f" Skipping {p_name} to prioritize requested patients...")
+            continue
+            
         pbar = tqdm(total=samples_per_patient, initial=patient_count)
         
         while patient_count < samples_per_patient:
@@ -220,8 +225,7 @@ def collect_simglucose_data(n_train=2000, n_test=200, n_oracle_trials=10, save_p
                 try:
                     if not is_test:
                         if state.CGM < 70:
-                            patient_count += 1
-                            pbar.update(1)
+                            # Skip but don't count towards the target
                             continue
 
                         tqdm.write(f" [{p_name}] Found meal: {meal}g at {master_env.time}. Collecting train sample...")
@@ -252,6 +256,15 @@ def collect_simglucose_data(n_train=2000, n_test=200, n_oracle_trials=10, save_p
                         queue.close()
                         queue.join_thread()
                     else:
+                        # Test collection
+                        existing_test_this_p = sum(1 for c in test_contexts if c[2] == float(p_idx))
+                        if existing_test_this_p >= test_per_patient:
+                            # We already have enough test samples, but maybe we need more train?
+                            # For now, let's just break or continue to reach samples_per_patient
+                            patient_count = samples_per_patient 
+                            pbar.update(samples_per_patient - pbar.n)
+                            continue
+
                         if state.CGM < 70:
                             pass 
                         else:
@@ -294,17 +307,15 @@ def collect_simglucose_data(n_train=2000, n_test=200, n_oracle_trials=10, save_p
                 except Exception as e:
                     tqdm.write(f" [WARNING] Simulation error for {p_name} at {master_env.time}: {e}")
 
-                # Checkpointing every 100 samples total
-                total_samples = len(train_contexts) + len(test_contexts)
-                if total_samples > 0 and total_samples % 100 == 0:
-                    tqdm.write(f" [CHECKPOINT] Saving {total_samples} samples to {save_path}...")
-                    np.savez(save_path, 
-                             train_contexts=np.array(train_contexts), 
-                             train_actions=np.array(train_actions), 
-                             train_rewards=np.array(train_rewards), 
-                             test_contexts=np.array(test_contexts), 
-                             test_mean=np.array(test_mean_matrix),
-                             test_cvar=np.array(test_cvar_matrix))
+                # Save every time new data is added
+                tqdm.write(f" [SAVE] Saving {len(train_contexts) + len(test_contexts)} samples to {save_path}...")
+                np.savez(save_path, 
+                         train_contexts=np.array(train_contexts), 
+                         train_actions=np.array(train_actions), 
+                         train_rewards=np.array(train_rewards), 
+                         test_contexts=np.array(test_contexts), 
+                         test_mean=np.array(test_mean_matrix),
+                         test_cvar=np.array(test_cvar_matrix))
 
             try:
                 master_action = controller.policy(state, reward, done, **info)
