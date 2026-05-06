@@ -170,11 +170,25 @@ def collect_simglucose_data(n_train=2000, n_test=200, n_oracle_trials=10, save_p
     samples_per_patient = (n_train + n_test) // len(patient_names)
     test_per_patient = n_test // len(patient_names)
     
+    if not os.path.exists('data'):
+        os.makedirs('data')
+
     train_contexts, train_actions, train_rewards = [], [], []
     test_contexts, test_mean_matrix, test_cvar_matrix = [], [], []
 
-    if not os.path.exists('data'):
-        os.makedirs('data')
+    # Resume from existing file if available
+    if os.path.exists(save_path):
+        try:
+            with np.load(save_path, allow_pickle=True) as data:
+                train_contexts = list(data['train_contexts'])
+                train_actions = list(data['train_actions'])
+                train_rewards = list(data['train_rewards'])
+                test_contexts = list(data['test_contexts'])
+                test_mean_matrix = list(data['test_mean'])
+                test_cvar_matrix = list(data['test_cvar'])
+            print(f" [RESUME] Loaded {len(train_contexts) + len(test_contexts)} existing samples from {save_path}")
+        except Exception as e:
+            print(f" [WARNING] Could not resume from {save_path}: {e}")
 
     for p_idx, p_name in enumerate(patient_names):
         print(f"\nProcessing: {p_name}")
@@ -185,8 +199,12 @@ def collect_simglucose_data(n_train=2000, n_test=200, n_oracle_trials=10, save_p
         controller = BBController()
         state, reward, done, info = master_env.reset()
 
-        pbar = tqdm(total=samples_per_patient)
-        patient_count = 0
+        # Count existing samples for this patient to resume progress
+        existing_train = sum(1 for c in train_contexts if c[2] == float(p_idx))
+        existing_test = sum(1 for c in test_contexts if c[2] == float(p_idx))
+        patient_count = existing_train + existing_test
+        
+        pbar = tqdm(total=samples_per_patient, initial=patient_count)
         
         while patient_count < samples_per_patient:
             meal = master_env.scenario.get_action(master_env.time).meal
@@ -276,6 +294,18 @@ def collect_simglucose_data(n_train=2000, n_test=200, n_oracle_trials=10, save_p
                 except Exception as e:
                     tqdm.write(f" [WARNING] Simulation error for {p_name} at {master_env.time}: {e}")
 
+                # Checkpointing every 100 samples total
+                total_samples = len(train_contexts) + len(test_contexts)
+                if total_samples > 0 and total_samples % 100 == 0:
+                    tqdm.write(f" [CHECKPOINT] Saving {total_samples} samples to {save_path}...")
+                    np.savez(save_path, 
+                             train_contexts=np.array(train_contexts), 
+                             train_actions=np.array(train_actions), 
+                             train_rewards=np.array(train_rewards), 
+                             test_contexts=np.array(test_contexts), 
+                             test_mean=np.array(test_mean_matrix),
+                             test_cvar=np.array(test_cvar_matrix))
+
             try:
                 master_action = controller.policy(state, reward, done, **info)
                 state, reward, done, info = master_env.step(master_action)
@@ -302,5 +332,5 @@ def collect_simglucose_data(n_train=2000, n_test=200, n_oracle_trials=10, save_p
 
 if __name__ == "__main__":
     # Increased sample size for a more robust dataset
-    collect_simglucose_data(n_train=5000, n_test=1000, n_oracle_trials=20)
+    collect_simglucose_data(n_train=2000, n_test=400, n_oracle_trials=20)
 
