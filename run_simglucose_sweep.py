@@ -8,13 +8,13 @@ CONTEXT_DIM = 4
 NUM_ACTIONS = 11
 NUM_SIM = 10        # Number of simulations per N
 LAYER_SIZES = "32,32"  
-DATA_PATH = "data/simglucose_2patients.npz"
+DATA_PATH = "data/simglucose_offline.npz"
 NUM_TEST = 500    
 
 # Algorithm parameters from run_robust_sweep.py
 RISK_MEASURE = "cvar"
 ALPHA = 0.05
-TAU_N = 150.0       # Adjusted to clip extreme outliers while preserving normal Simglucose range
+TAU_N = 50.0       # Reduced to enable clipping for better robustness in Simglucose
 LAMBDA0 = 10.0
 POLICY_TYPE = "risk-aware"
 AGENT_EVAL_METHOD = "local"
@@ -30,7 +30,7 @@ ALGO_GROUPS = [
 ]
 
 # Sweep over num_contexts (N)
-N_VALUES = [50, 100, 200, 400]
+N_VALUES = [0, 100, 200, 400]
 
 # 2. Experimental Loop
 for algo in ALGO_GROUPS:
@@ -42,10 +42,10 @@ for algo in ALGO_GROUPS:
         LAMBDA = 1e-3
         TRUNC_MODE = "none"
     elif algo == "robust-offline":
-        BETA = 0.5       # Increased for more pessimism with small data
-        NUM_STEPS = 2000 # Increased training steps
+        BETA = 0.05      # Reduced to avoid over-pessimism and focus on Action 3 accuracy
+        NUM_STEPS = 5000 # Increased training steps for better Tofu loss convergence
         LR = 1e-3
-        LAMBDA = 1e-4
+        LAMBDA = 1e-2    # Increased regularization to stabilize learning
         TRUNC_MODE = "clip" # Re-enabled for heavy-tail robustness
     else:
         BETA = 0.5       # Standard Neural LCB also uses 0.5
