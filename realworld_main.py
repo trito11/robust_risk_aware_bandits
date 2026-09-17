@@ -444,7 +444,7 @@ def main(unused_argv):
                 regret = np.mean(current_mean_opt - sel_vals)
                 acc    = np.mean(test_actions.ravel() == opt_actions.ravel())
 
-                # Ground-truth risk stats (Calculated Marginally for accuracy)
+                # Ground-truth risk stats
                 if FLAGS.data_type == 'robust_syn' and oracle_noise is not None:
                     # Marginal Agent Evaluation: Union of samples across all contexts
                     I_test = test_ctx.shape[0]
@@ -452,16 +452,22 @@ def main(unused_argv):
                     expanded_sel_vals = np.repeat(sel_vals, M_noise)
                     expanded_noise = np.tile(oracle_noise, I_test)
                     agent_noisy_r = expanded_sel_vals + expanded_noise
-                elif FLAGS.data_type == 'simglucose':
-                    agent_noisy_r = sel_vals
-                else:
-                    agent_noisy_r = None
-
-                if agent_noisy_r is not None:
                     gt_mean = np.mean(agent_noisy_r)
                     gt_var  = np.var(agent_noisy_r)
                     sorted_agent = np.sort(agent_noisy_r)
                     # Marginal CVaR
+                    gt_cvar = np.mean(sorted_agent[:int(FLAGS.alpha * len(sorted_agent))])
+                elif FLAGS.data_type == 'simglucose' and hasattr(data, 'test_cvar') and data.test_cvar is not None:
+                    gt_mean = np.mean(sel_vals)
+                    gt_var  = np.var(sel_vals)
+                    # Local (Conditional) CVaR: lấy đúng CVaR tại từng context tương ứng với action của agent
+                    agent_cvar_per_ctx = data.test_cvar[np.arange(test_ctx.shape[0]), test_actions.ravel()]
+                    gt_cvar = np.mean(agent_cvar_per_ctx)
+                elif FLAGS.data_type == 'simglucose':
+                    agent_noisy_r = sel_vals
+                    gt_mean = np.mean(agent_noisy_r)
+                    gt_var  = np.var(agent_noisy_r)
+                    sorted_agent = np.sort(agent_noisy_r)
                     gt_cvar = np.mean(sorted_agent[:int(FLAGS.alpha * len(sorted_agent))])
                 else:
                     gt_mean = gt_var = gt_cvar = 0.0

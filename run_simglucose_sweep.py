@@ -10,12 +10,13 @@ ALGO_GROUPS = [
     "quantile-risk",        # QuantileRiskNeuralBandit
     "risk-lin-lcb",         # RiskLinLCB
     # "neural-regression",  # NeuralRegressionOffline
-    "pessimistic-cdf",      # paper arXiv:2605.15620, context-independent
+    # "pessimistic-cdf",      # paper arXiv:2605.15620, context-independent
     "pessimistic-cdf-ctx",  # context-aware (chậm hơn, có thể comment nếu chỉ test global)
 ]
 
-N_VALUES     = [0, 100, 200, 400]
-ALPHA_VALUES = [0.01, 0.05, 0.1, 0.2]
+N_VALUES     = [100, 250, 500, 1000, 2000]
+
+ALPHA_VALUES = [ 0.05, 0.1, 0.2]
 
 # ──────────────────────────────────────────────────────────────────
 # 2. Cấu hình cố định cho Simglucose
@@ -25,13 +26,13 @@ CONTEXT_DIM        = 4
 NUM_ACTIONS        = 11
 NUM_SIM            = 10
 LAYER_SIZES        = "32,32"
-NUM_TEST           = 500
+NUM_TEST           = 400        # Số mẫu test thực tế trong simglucose_offline.npz
 RISK_MEASURE       = "cvar"
 TAU_N              = 50.0       # Truncation threshold for heavy-tail robustness
 LAMBDA0            = 10.0
 POLICY_TYPE        = "risk-aware"
 AGENT_EVAL_METHOD  = "local"
-ORACLE_EVAL_METHOD = "global"
+ORACLE_EVAL_METHOD = "local"
 
 # ──────────────────────────────────────────────────────────────────
 # 3. Cấu hình riêng cho Pessimistic CDF (arXiv:2605.15620)
