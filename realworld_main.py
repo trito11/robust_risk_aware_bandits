@@ -15,6 +15,7 @@ import time
 from core.contextual_bandit import contextual_bandit_runner
 from algorithms.neural_offline_bandit import ExactNeuraLCBV2, NeuralGreedyV2, ApproxNeuraLCBV2, RobustOfflineBatchNeuraLCB, NeuralRegressionOffline, RiskExactNeuraLCBV2, QuantileRiskNeuralBandit
 from algorithms.risk_lin_lcb import RiskLinLCB
+from algorithms.pessimistic_cdf_bandit import PessimisticCDFBandit, PessimisticCDFContextualBandit
 from algorithms.lin_lcb import LinLCB 
 from algorithms.kern_lcb import KernLCB 
 from algorithms.uniform_sampling import UniformSampling
@@ -79,6 +80,11 @@ flags.DEFINE_string('noise_type', 'student-t', 'student-t, gaussian, binary-heav
 flags.DEFINE_string('function_type', 'quadratic', 'linear, quadratic, quadratic2, cosine')
 flags.DEFINE_string('policy_type', 'risk-aware', 'risk-aware or standard-lcb')
 flags.DEFINE_string('save_model_path', 'results/model.pkl', 'Path to save weights after training')
+
+# Pessimistic CDF Bandit (arXiv:2605.15620)
+flags.DEFINE_string('cdf_estimator', 'IS', 'CDF estimator for PessimisticCDF: IS | WIS | DR')
+flags.DEFINE_float('pess_delta', 0.05, 'Confidence level delta for PessimisticCDF R(pi) bound')
+flags.DEFINE_integer('pess_d_pi', 1, 'Policy class complexity d_Pi for PessimisticCDF R(pi) bound')
 
 # Logging
 flags.DEFINE_boolean('use_wandb', False, 'Whether to use wandb for logging')
@@ -191,7 +197,12 @@ def main(unused_argv):
             'entropic_theta': hparams.entropic_theta,
             'variance_lambda': hparams.variance_lambda,
             'chunk_size': hparams.chunk_size,
-            'policy_type': hparams.policy_type
+            'policy_type': hparams.policy_type,
+            # PessimisticCDF-specific
+            'cdf_estimator': FLAGS.cdf_estimator,   # 'IS' | 'WIS' | 'DR'
+            'delta': FLAGS.pess_delta,               # confidence param for R(pi)
+            'd_Pi': FLAGS.pess_d_pi,                 # policy class complexity
+            'behavior_policy_est': 'uniform',        # use action marginals
         }
     )
 
@@ -270,6 +281,29 @@ def main(unused_argv):
             FLAGS.data_type, eval_m, oracle_m, FLAGS.risk_measure, FLAGS.alpha, FLAGS.beta, FLAGS.num_contexts
         )
 
+    if FLAGS.algo_group == 'pessimistic-cdf':
+        # Paper: Wan, Li, Wu (2026) arXiv:2605.15620
+        # Context-independent version (global action selection)
+        algos = [
+            PessimisticCDFBandit(lin_hparams)
+        ]
+        algo_prefix = 'pessimistic_cdf_{}_agent={}_oracle={}_risk={}_est={}_alpha={}_beta={}_n={}'.format(
+            FLAGS.data_type, eval_m, oracle_m, FLAGS.risk_measure,
+            FLAGS.cdf_estimator.lower(), FLAGS.alpha, FLAGS.beta, FLAGS.num_contexts
+        )
+
+    if FLAGS.algo_group == 'pessimistic-cdf-ctx':
+        # Paper: Wan, Li, Wu (2026) arXiv:2605.15620
+        # Context-aware version with kernel-weighted local CDF
+        algos = [
+            PessimisticCDFContextualBandit(lin_hparams)
+        ]
+        algo_prefix = 'pessimistic_cdf_ctx_{}_agent={}_oracle={}_risk={}_est={}_alpha={}_beta={}_rbf={}_n={}'.format(
+            FLAGS.data_type, eval_m, oracle_m, FLAGS.risk_measure,
+            FLAGS.cdf_estimator.lower(), FLAGS.alpha, FLAGS.beta,
+            FLAGS.rbf_sigma, FLAGS.num_contexts
+        )
+
     #==============================
     # W&B Init
     #==============================
@@ -286,7 +320,8 @@ def main(unused_argv):
     #==============================
     file_name = os.path.join(res_dir, algo_prefix) + '.npz' 
 
-    if FLAGS.algo_group in ('robust-offline', 'neural-regression', 'risk-exact', 'quantile-risk', 'risk-lin-lcb'):
+    if FLAGS.algo_group in ('robust-offline', 'neural-regression', 'risk-exact', 'quantile-risk', 'risk-lin-lcb',
+                             'pessimistic-cdf', 'pessimistic-cdf-ctx'):
         # -------------------------------------------------------
         # Generic offline batch runner – works for any group that
         # uses the train_offline_batch / sample_action interface.

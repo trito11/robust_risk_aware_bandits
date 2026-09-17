@@ -83,75 +83,91 @@ class ManualMealScenario:
     def reset(self):
         self.meal_sent = False
 
-def single_sim_eval(p_name, meal, current_time, state_y, sensor_last_state, bolus, seed):
-    """Helper to run a single simulation trace and return reward."""
+def single_sim_eval(p_name, meal, current_time, state_y, sensor_last_state, bolus, nominal_basal, seed):
+    """Helper to run a single simulation trace and return reward.
+    
+    Args:
+        nominal_basal: The continuous basal rate from the BB controller at collection
+            time. This MUST be non-zero to avoid catastrophic hyperglycemia over the
+            180-step (9 hour) evaluation window.
+    """
     patient = T1DPatient.withName(p_name)
     sensor = CGMSensor.withName('Dexcom', seed=seed)
     pump = InsulinPump.withName('Insulet')
-    # Scenario should NOT provide the meal if we pass it manually in env.step at the first step
-    # Or better: let scenario handle the meal and we only pass insulin.
     scenario = ManualMealScenario(current_time, meal)
     env = T1DSimEnv(patient, sensor, pump, scenario)
     env.reset()
-    
-    # Sync time and state carefully
-    
-    
-    # Inject state via protected attributes only if they are not read-only
-    for attr in ['_state', '_y', 'y']:
-        if hasattr(env.patient, attr):
-            try:
-                setattr(env.patient, attr, state_y.copy())
-            except: pass
-        
-    if hasattr(env.patient, '_odesolver'):
-        try:
-            # Re-initialize solver with the correct state and relative time 0
-            env.patient._odesolver.set_initial_value(state_y.copy(), 0)
-        except:
-            try:
-                env.patient._odesolver._y = state_y.copy()
-                env.patient._odesolver.t = 0
-            except: pass
-            
-    if sensor_last_state is not None:
-        env.sensor.last_state = sensor_last_state
-    
-    # Force patient BG state into CGM sensor to avoid delay-induced crashes at start
-    if hasattr(env.sensor, 'last_state'):
-        # SimGlucose CGM sensor stores the last BG value to simulate delay
-        # state_y[0] is usually the blood glucose (G) in Magni model
-        env.sensor.last_state = state_y[0]
-    
+
+    # --- Sync physiological state from master_env snapshot ---
+    sync_env_state_standalone(env, state_y, sensor_last_state, current_time)
+
     bg_window = []
-    # Use positional arguments for EnvAction (basal, bolus)
-    # The meal is handled by ManualMealScenario.get_action(current_time)
-    current_act = EnvAction(0, bolus) 
-    
+    # Step 1: deliver bolus + basal. Basal must be the nominal rate, NOT zero,
+    # otherwise BG will shoot up over the 9-hour window regardless of bolus.
+    current_act = EnvAction(nominal_basal, bolus)
+
     for i in range(180):
         try:
             s, _, _, _ = env.step(current_act)
             if s is None or not hasattr(s, 'CGM') or np.isnan(s.CGM):
                 break
             bg_window.append(s.CGM)
-        except Exception as e:
-            # print(f"Simulation step error: {e}")
+        except Exception:
             break
-        current_act = EnvAction(0, 0)
-    
+        # After first step, only deliver continuous basal (no more bolus)
+        current_act = EnvAction(nominal_basal, 0)
+
     return get_magni_reward(bg_window)
+
+
+def sync_env_state_standalone(env, state_y, sensor_last_state, current_time):
+    """Inject a patient state snapshot into a freshly-reset environment."""
+    # Inject ODE state
+    for attr in ['_state', '_y', 'y']:
+        if hasattr(env.patient, attr):
+            try:
+                setattr(env.patient, attr, state_y.copy())
+            except Exception:
+                pass
+
+    if hasattr(env.patient, '_odesolver'):
+        try:
+            env.patient._odesolver.set_initial_value(state_y.copy(), 0)
+        except Exception:
+            try:
+                env.patient._odesolver._y = state_y.copy()
+                env.patient._odesolver.t = 0
+            except Exception:
+                pass
+
+    # Inject sensor state – use BG (state_y[0]) as fallback
+    if sensor_last_state is not None:
+        env.sensor.last_state = sensor_last_state
+    elif hasattr(env.sensor, 'last_state'):
+        env.sensor.last_state = state_y[0]
+
+    # Sync environment clock
+    for attr in ['_time', 'env_time', 'time']:
+        if hasattr(env, attr):
+            try:
+                setattr(env, attr, current_time)
+                break
+            except Exception:
+                continue
+    if hasattr(env, 'scenario'):
+        env.scenario.start_time = current_time
 
 def log_error(msg):
     with open("simglucose_error.log", "a") as f:
         f.write(f"{datetime.now()} - {msg}\n")
 
-def eval_sim_worker(p_name, meal, current_time, state_y, sensor_last_state, bolus_list, seed_base, queue):
+def eval_sim_worker(p_name, meal, current_time, state_y, sensor_last_state, bolus_list, nominal_basal, seed_base, queue):
     """Worker function to run one or more simulations."""
     try:
         results = []
         for i, bolus in enumerate(bolus_list):
             try:
-                res = single_sim_eval(p_name, meal, current_time, state_y, sensor_last_state, bolus, seed_base + i)
+                res = single_sim_eval(p_name, meal, current_time, state_y, sensor_last_state, bolus, nominal_basal, seed_base + i)
                 results.append(res)
             except Exception as e:
                 import traceback
@@ -166,10 +182,21 @@ def eval_sim_worker(p_name, meal, current_time, state_y, sensor_last_state, bolu
         queue.put(("ERROR", str(e)))
 
 def collect_simglucose_data(n_train=2000, n_test=200, n_oracle_trials=10, save_path='data/simglucose_offline.npz', alpha=0.05):
-    patient_names = ['child#001', 'child#002', 'adolescent#001', 'adult#001']
+    # Only collect from the two active patients to avoid sample-count mismatch.
+    # If you want all 4, change this list AND remove the skip block below.
+    patient_names = ['child#001', 'adolescent#001']
     samples_per_patient = (n_train + n_test) // len(patient_names)
     test_per_patient = n_test // len(patient_names)
-    
+
+    # Bug fix: warn when n_oracle_trials is too small for reliable CVaR.
+    # int(alpha * n_oracle_trials) must be >= 1 for a meaningful tail estimate.
+    # E.g. alpha=0.05 requires n_oracle_trials >= 20.
+    min_trials_for_cvar = int(np.ceil(1.0 / alpha))
+    if n_oracle_trials < min_trials_for_cvar:
+        print(f"[WARNING] n_oracle_trials={n_oracle_trials} is too small for alpha={alpha}. "
+              f"CVaR will degenerate to the minimum reward (only 1 sample used). "
+              f"Recommend n_oracle_trials >= {min_trials_for_cvar}.")
+
     if not os.path.exists('data'):
         os.makedirs('data')
 
@@ -204,13 +231,23 @@ def collect_simglucose_data(n_train=2000, n_test=200, n_oracle_trials=10, save_p
         existing_test = sum(1 for c in test_contexts if c[2] == float(p_idx))
         patient_count = existing_train + existing_test
         
-        # Prioritize adolescent and adult for this run
-        if p_name in ['adult#001', 'child#002']:
-            print(f" Skipping {p_name} to prioritize requested patients...")
-            continue
-            
         pbar = tqdm(total=samples_per_patient, initial=patient_count)
         
+        # Bug fix: helper to advance master_env by one step.
+        # Used to ensure we ALWAYS call master_env.step() before any `continue`
+        # inside the meal-detection block, preventing an infinite loop.
+        def advance_master_env():
+            nonlocal state, reward, done, info
+            try:
+                master_action = controller.policy(state, reward, done, **info)
+                state, reward, done, info = master_env.step(master_action)
+                if master_env.time.minute == 0:
+                    pbar.set_description(f"Processing {p_name} | Day: {master_env.time.date()}")
+                if done:
+                    state, reward, done, info = master_env.reset()
+            except Exception:
+                state, reward, done, info = master_env.reset()
+
         while patient_count < samples_per_patient:
             meal = master_env.scenario.get_action(master_env.time).meal
             if meal > 0:
@@ -225,23 +262,26 @@ def collect_simglucose_data(n_train=2000, n_test=200, n_oracle_trials=10, save_p
                 try:
                     if not is_test:
                         if state.CGM < 70:
-                            # Skip but don't count towards the target
+                            # Hypoglycemic state – skip this meal event entirely.
+                            # Bug fix: must advance env before continue to avoid infinite loop.
+                            advance_master_env()
                             continue
 
                         tqdm.write(f" [{p_name}] Found meal: {meal}g at {master_env.time}. Collecting train sample...")
                         ctrl_action = controller.policy(state, reward, done, **info)
+                        nominal_basal = ctrl_action.basal
                         bolus = ctrl_action.bolus
                         max_bolus = 3 if 'child' in p_name else 10
-                        if np.random.rand() < 0.3: 
+                        if np.random.rand() < 0.3:
                             noise = np.random.uniform(-1, 1) if 'child' in p_name else np.random.uniform(-2, 2)
                             bolus += noise
                         bolus = int(np.round(max(0, min(max_bolus, bolus))))
-                        
+
                         queue = mp.Queue()
-                        p = mp.Process(target=eval_sim_worker, args=(p_name, meal, master_env.time, state_y, sensor_state, [bolus], p_idx + 100 + patient_count, queue))
+                        p = mp.Process(target=eval_sim_worker, args=(p_name, meal, master_env.time, state_y, sensor_state, [bolus], nominal_basal, p_idx + 100 + patient_count, queue))
                         p.start()
                         p.join(timeout=40)
-                        
+
                         if p.is_alive():
                             p.terminate()
                             p.join()
@@ -259,51 +299,75 @@ def collect_simglucose_data(n_train=2000, n_test=200, n_oracle_trials=10, save_p
                         # Test collection
                         existing_test_this_p = sum(1 for c in test_contexts if c[2] == float(p_idx))
                         if existing_test_this_p >= test_per_patient:
-                            # We already have enough test samples, but maybe we need more train?
-                            # For now, let's just break or continue to reach samples_per_patient
-                            patient_count = samples_per_patient 
+                            # Already have enough test samples for this patient; bump
+                            # patient_count so the outer while-loop can exit cleanly.
+                            patient_count = samples_per_patient
                             pbar.update(samples_per_patient - pbar.n)
+                            # Bug fix: advance env before continue to avoid infinite loop.
+                            advance_master_env()
                             continue
 
                         if state.CGM < 70:
-                            pass 
+                            # Hypoglycemic state – skip this test meal event.
+                            # Bug fix: advance env before continue to avoid infinite loop.
+                            advance_master_env()
+                            continue
+
+                        tqdm.write(f" [{p_name}] Found test meal: {meal}g at {master_env.time}. Running batched oracle...")
+                        ctrl_action = controller.policy(state, reward, done, **info)
+                        nominal_basal = ctrl_action.basal
+
+                        # BATCHED ORACLE EVALUATION
+                        # Bug fix: for child patients, bolus > 3 is physically capped to 3,
+                        # so we only need to evaluate 4 unique actions (0-3) instead of 11.
+                        # We then replicate results for arms 4-10 to maintain the (N, 11)
+                        # matrix shape expected by SimglucoseData / downstream algorithms.
+                        is_child = 'child' in p_name
+                        max_bolus_oracle = 3 if is_child else 10
+                        n_unique_actions = max_bolus_oracle + 1  # 4 for child, 11 for adult
+                        all_boluses = []
+                        for a in range(n_unique_actions):
+                            all_boluses.extend([a] * n_oracle_trials)
+
+                        queue = mp.Queue()
+                        p = mp.Process(target=eval_sim_worker, args=(p_name, meal, master_env.time, state_y, sensor_state, all_boluses, nominal_basal, p_idx + 500 + patient_count, queue))
+                        p.start()
+                        p.join(timeout=600)  # 10 mins for up to 110 simulations
+
+                        if p.is_alive():
+                            p.terminate()
+                            p.join()
+                            tqdm.write(f" [TIMEOUT] Oracle evaluation timed out for {p_name} at {master_env.time}")
                         else:
-                            tqdm.write(f" [{p_name}] Found test meal: {meal}g at {master_env.time}. Running batched oracle...")
-                            # BATCHED ORACLE EVALUATION: 11 actions * n_trials in ONE process
-                            all_boluses = []
-                            for a in range(11):
-                                actual_a = a if 'child' not in p_name else min(a, 3)
-                                all_boluses.extend([actual_a] * n_oracle_trials)
-                            
-                            queue = mp.Queue()
-                            p = mp.Process(target=eval_sim_worker, args=(p_name, meal, master_env.time, state_y, sensor_state, all_boluses, p_idx + 500 + patient_count, queue))
-                            p.start()
-                            p.join(timeout=600) # Increased to 10 mins for 110 simulations
-                            
-                            if p.is_alive():
-                                p.terminate()
-                                p.join()
-                                tqdm.write(f" [TIMEOUT] Oracle evaluation timed out for {p_name} at {master_env.time}")
+                            res = queue.get() if not queue.empty() else ("TIMEOUT", None)
+                            if res[0] == "SUCCESS":
+                                all_rewards = res[1]
+                                action_means, action_cvars = [], []
+                                # Build per-unique-action stats
+                                unique_means, unique_cvars = [], []
+                                n_tail = max(1, int(alpha * n_oracle_trials))
+                                for a_idx in range(n_unique_actions):
+                                    trial_rewards = all_rewards[a_idx * n_oracle_trials : (a_idx + 1) * n_oracle_trials]
+                                    unique_means.append(float(np.mean(trial_rewards)))
+                                    sorted_rew = np.sort(trial_rewards)
+                                    unique_cvars.append(float(np.mean(sorted_rew[:n_tail])))
+
+                                # Replicate capped-action stats for arms beyond the physical limit
+                                # so the output matrix is always (N_test, 11).
+                                for a in range(11):
+                                    capped = min(a, max_bolus_oracle)
+                                    action_means.append(unique_means[capped])
+                                    action_cvars.append(unique_cvars[capped])
+
+                                test_contexts.append(ctx)
+                                test_mean_matrix.append(action_means)
+                                test_cvar_matrix.append(action_cvars)
+                                patient_count += 1
+                                pbar.update(1)
                             else:
-                                res = queue.get() if not queue.empty() else ("TIMEOUT", None)
-                                if res[0] == "SUCCESS":
-                                    all_rewards = res[1]
-                                    action_means, action_cvars = [], []
-                                    for a_idx in range(11):
-                                        trial_rewards = all_rewards[a_idx * n_oracle_trials : (a_idx + 1) * n_oracle_trials]
-                                        action_means.append(np.mean(trial_rewards))
-                                        sorted_rew = np.sort(trial_rewards)
-                                        action_cvars.append(np.mean(sorted_rew[:max(1, int(alpha * n_oracle_trials))]))
-                                    
-                                    test_contexts.append(ctx)
-                                    test_mean_matrix.append(action_means)
-                                    test_cvar_matrix.append(action_cvars)
-                                    patient_count += 1
-                                    pbar.update(1)
-                                else:
-                                    tqdm.write(f" [ERROR] Oracle evaluation failed for {p_name}: {res[1]}")
-                            queue.close()
-                            queue.join_thread()
+                                tqdm.write(f" [ERROR] Oracle evaluation failed for {p_name}: {res[1]}")
+                        queue.close()
+                        queue.join_thread()
                 except Exception as e:
                     tqdm.write(f" [WARNING] Simulation error for {p_name} at {master_env.time}: {e}")
 
@@ -317,18 +381,7 @@ def collect_simglucose_data(n_train=2000, n_test=200, n_oracle_trials=10, save_p
                          test_mean=np.array(test_mean_matrix),
                          test_cvar=np.array(test_cvar_matrix))
 
-            try:
-                master_action = controller.policy(state, reward, done, **info)
-                state, reward, done, info = master_env.step(master_action)
-                
-                # Update description instead of printing with \r
-                if master_env.time.minute == 0:
-                    pbar.set_description(f"Processing {p_name} | Day: {master_env.time.date()}")
-
-                if done: 
-                    state, reward, done, info = master_env.reset()
-            except Exception:
-                state, reward, done, info = master_env.reset()
+            advance_master_env()
         pbar.close()
 
     np.savez(save_path, 
@@ -343,5 +396,5 @@ def collect_simglucose_data(n_train=2000, n_test=200, n_oracle_trials=10, save_p
 
 if __name__ == "__main__":
     # Increased sample size for a more robust dataset
-    collect_simglucose_data(n_train=2000, n_test=400, n_oracle_trials=10)
+    collect_simglucose_data(n_train=2000, n_test=400, n_oracle_trials=20)
 
