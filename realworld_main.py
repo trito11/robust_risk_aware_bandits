@@ -136,9 +136,13 @@ def main(unused_argv):
             eps=FLAGS.eps
         )
     elif FLAGS.data_type == 'simglucose':
+        # Default to 3 actions for Simglucose if unconfigured (default flag is 30)
+        simglucose_actions = FLAGS.num_actions if FLAGS.num_actions <= 11 else 3
         data = SimglucoseData(
             path='data/simglucose_offline.npz',
-            num_contexts=FLAGS.num_contexts
+            num_contexts=FLAGS.num_contexts,
+            num_actions=simglucose_actions,
+            alpha=FLAGS.alpha
         )
     else:
         raise NotImplementedError
@@ -386,17 +390,17 @@ def main(unused_argv):
             # Simglucose or other real-world data
             if FLAGS.data_type == 'simglucose' and hasattr(data, 'test_cvar') and data.test_cvar is not None:
                 # Use pre-calculated True CVaR for Simglucose
-                # Oracle actions are chosen based on the best CVaR
+                # Oracle actions are chosen based on the best CVaR within available action space
                 oracle_actions = np.argmax(data.test_cvar, axis=1)
                 opt_vals_full = test_mean_full[np.arange(test_mean_full.shape[0]), oracle_actions.ravel()]
-                oracle_cvar = np.mean(data.test_cvar[np.arange(data.test_cvar.shape[0]), oracle_actions.ravel()])
+                oracle_cvar = float(np.mean(data.test_cvar[np.arange(data.test_cvar.shape[0]), oracle_actions.ravel()]))
             else:
                 oracle_actions = np.argmax(test_mean_full, axis=1)
                 opt_vals_full = test_mean_full[np.arange(test_mean_full.shape[0]), oracle_actions.ravel()]
                 oracle_cvar = 0.0
             
-            oracle_mean = np.mean(opt_vals_full)
-            oracle_var  = np.var(opt_vals_full)
+            oracle_mean = float(np.mean(opt_vals_full))
+            oracle_var  = float(np.var(opt_vals_full))
             oracle_noise = None
             
             # --- Oracle Mean (For Standard Regret) ---
@@ -458,11 +462,11 @@ def main(unused_argv):
                     # Marginal CVaR
                     gt_cvar = np.mean(sorted_agent[:int(FLAGS.alpha * len(sorted_agent))])
                 elif FLAGS.data_type == 'simglucose' and hasattr(data, 'test_cvar') and data.test_cvar is not None:
-                    gt_mean = np.mean(sel_vals)
-                    gt_var  = np.var(sel_vals)
+                    gt_mean = float(np.mean(sel_vals))
+                    gt_var  = float(np.var(sel_vals))
                     # Local (Conditional) CVaR: lấy đúng CVaR tại từng context tương ứng với action của agent
                     agent_cvar_per_ctx = data.test_cvar[np.arange(test_ctx.shape[0]), test_actions.ravel()]
-                    gt_cvar = np.mean(agent_cvar_per_ctx)
+                    gt_cvar = float(np.mean(agent_cvar_per_ctx))
                 elif FLAGS.data_type == 'simglucose':
                     agent_noisy_r = sel_vals
                     gt_mean = np.mean(agent_noisy_r)

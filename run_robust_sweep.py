@@ -52,6 +52,8 @@ for algo in ALGO_GROUPS:
         # Tinh chỉnh hyperparams theo thuật toán
         if algo == "quantile-risk":
             BETA = 0.005; NUM_STEPS = 3000; LR = 5e-4; LAMBDA = 1e-3
+        elif algo in ("pessimistic-cdf", "pessimistic-cdf-ctx"):
+            BETA = 0.05;  NUM_STEPS = 1000; LR = 1e-3; LAMBDA = 1e-4
         else:
             BETA = 0.1;   NUM_STEPS = 1000; LR = 1e-3; LAMBDA = 1e-4
 

@@ -23,7 +23,7 @@ ALPHA_VALUES = [ 0.05, 0.1, 0.2]
 # ──────────────────────────────────────────────────────────────────
 DATA_TYPE          = "simglucose"
 CONTEXT_DIM        = 4
-NUM_ACTIONS        = 11
+NUM_ACTIONS        = 3          # Active bolus units 0, 1, 2 (actions 3..10 have 0% occurrences in train)
 NUM_SIM            = 10
 LAYER_SIZES        = "32,32"
 NUM_TEST           = 400        # Số mẫu test thực tế trong simglucose_offline.npz
@@ -63,7 +63,7 @@ for algo in ALGO_GROUPS:
         LAMBDA = 1e-2    # Regularization to stabilize learning
         TRUNC_MODE = "clip" # Re-enabled for heavy-tail robustness
     elif algo in ("pessimistic-cdf", "pessimistic-cdf-ctx"):
-        BETA = 0.1
+        BETA = 0.05
         NUM_STEPS = 1000
         LR = 1e-3
         LAMBDA = 1e-4

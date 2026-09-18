@@ -47,6 +47,33 @@ def _cvar(rewards: np.ndarray, alpha: float) -> float:
     return float(np.mean(sorted_r[:k]))
 
 
+def _weighted_cvar(rewards: np.ndarray, weights: np.ndarray, alpha: float) -> float:
+    """Compute CVaR at level alpha of samples with non-negative weights."""
+    if len(rewards) == 0:
+        return 0.0
+    w = np.array(weights, dtype=float)
+    w_sum = np.sum(w)
+    if w_sum <= 0:
+        w = np.ones_like(w) / len(w)
+    else:
+        w = w / w_sum
+
+    order = np.argsort(rewards)
+    sorted_r = rewards[order]
+    sorted_w = w[order]
+
+    cum_w = np.cumsum(sorted_w)
+    cutoff_mask = (cum_w <= alpha)
+    if not np.any(cutoff_mask):
+        return float(sorted_r[0])
+
+    idx = np.where(cutoff_mask)[0][-1]
+    selected_r = sorted_r[: idx + 1]
+    selected_w = sorted_w[: idx + 1]
+    denom = np.sum(selected_w)
+    return float(np.sum(selected_r * selected_w) / denom) if denom > 0 else float(sorted_r[0])
+
+
 def _mean_variance(rewards: np.ndarray, lam: float) -> float:
     """Mean – lambda * Variance."""
     return float(np.mean(rewards) - lam * np.var(rewards))
@@ -76,20 +103,22 @@ def _lipschitz_constant(risk_measure: str, alpha: float = 0.05,
                         lam: float = 0.1, y_max: float = 1.0) -> float:
     """
     Lipschitz constant L of rho w.r.t. sup-norm on CDFs (||F||_inf).
-
-    For CVaR_alpha: L = 1/alpha  (Sec 2, paper)
-    For mean: L = range(Y)
-    For mean-variance: L = range(Y) + 2*lam*range(Y)^2  (conservative)
-    For entropic: L ≈ range(Y)/theta  (conservative bound)
+    Paper: arXiv:2605.15620 (Wan, Li, Wu 2026), Section 2 & Appendix A.3:
+      - For CVaR_alpha: L = D / (1 - alpha)
+      - For mean: L = D
+      - For mean-variance: L = D + 3 * lam * D^2
+    where D = y_max is the bounded range of rewards: max(Y) - min(Y).
     """
+    D = max(float(y_max), 1e-4)
     if risk_measure == 'cvar':
-        return 1.0 / max(alpha, 1e-6)
+        denom = max(1.0 - alpha, 1e-4)
+        return float(D / denom)
     elif risk_measure == 'mean_variance':
-        return y_max + 2.0 * lam * (y_max ** 2)
+        return float(D + 3.0 * abs(lam) * (D ** 2))
     elif risk_measure == 'entropic':
-        return y_max / max(1e-6, 1.0)  # placeholder; depends on theta & Y
-    else:
-        return y_max  # mean: L = range(Y)
+        return float(D)
+    else:  # 'mean'
+        return float(D)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -170,20 +199,21 @@ def _compute_R_IS(beta_vals: np.ndarray, in_support: np.ndarray, n: int,
         r_pi     = (n - |I_pi|) / n
         R(pi)    = (sigma_pi + 2) * sqrt(8/n * [log(20/delta) + d_Pi * log(n*K^2)])
                    + r_pi
+    Since R(pi) bounds the CDF sup-norm ||F_hat - F||_inf, it is strictly capped at 1.0.
     """
     in_sup_mask = in_support.astype(bool)
     n_inf = in_sup_mask.sum()
     r_pi = (n - n_inf) / n
 
     if n_inf == 0:
-        return 1.0 + r_pi  # worst case
+        return 1.0
 
     beta_inf = beta_vals[in_sup_mask]
     sigma_pi = np.sqrt(np.mean(1.0 / (beta_inf ** 2 + 1e-12)))
 
     log_term = np.log(20.0 / delta) + d_Pi * np.log(n * (n_actions ** 2) + 1)
     concentration = (sigma_pi + 2.0) * np.sqrt(8.0 / n * log_term)
-    return float(concentration + r_pi)
+    return float(np.clip(concentration + r_pi, 0.0, 1.0))
 
 
 def _compute_R_WIS(beta_vals: np.ndarray, in_support: np.ndarray, n: int,
@@ -213,7 +243,7 @@ def _compute_R_WIS(beta_vals: np.ndarray, in_support: np.ndarray, n: int,
     log_term2 = np.log(20.0 / delta) + d_Pi * np.log(n * (n_actions ** 2) + 1)
     xi = ((sigma_pi / (1.0 - eta_pi) + 2.0) * np.sqrt(8.0 / n * log_term2)
           + (n_inf / n) * eta_pi / (1.0 - eta_pi) + r_pi)
-    return float(xi)
+    return float(np.clip(xi, 0.0, 1.0))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -316,16 +346,13 @@ class PessimisticCDFBandit(BanditAlgorithm):
         """
         Compute LCB for a deterministic policy pi_a(x) = a for all x.
 
-        LCB(a) = rho_hat(pi_a)  -  L * R(pi_a)
+        LCB(a) = rho_hat(pi_a) - beta * L * R(pi_a)
 
-        Steps:
-            1. Identify I_pi_a = {i: A_i == a}  (since pi_a(x)=a, beta(x,a) > 0
-               iff action a was ever taken, which we proxy by A_i == a)
-            2. Importance weight: w_i = 1{A_i == a} / beta_hat_i
-            3. Build pseudo-rewards via CDF estimator
-            4. Compute rho_hat from pseudo-rewards
-            5. Compute R(pi_a) from Theorem 2 or 3
-            6. LCB = rho_hat - L * R
+        Paper: arXiv:2605.15620 (Wan, Li, Wu 2026)
+            rho_hat: plug-in estimate of risk functional from empirical CDF
+            L      : Lipschitz constant = D / (1 - alpha)
+            R      : data-dependent confidence bound on CDF error in [0, 1]
+            beta   : pessimism tuning weight
         """
         n = self._n
         actions = self._actions
@@ -333,65 +360,57 @@ class PessimisticCDFBandit(BanditAlgorithm):
         beta = self._beta_hat
         K = self._K
 
-        # 1. Informative samples (i in I_pi_a) — those where A_i = a
-        in_support = (actions == a).astype(float)   # (n,)  1 if informative
+        # 1. Informative samples where A_i = a
+        mask = (actions == a)
+        n_a = int(mask.sum())
+        in_support = mask.astype(float)
 
-        # importance weight w_i = 1{A_i=a} / beta_hat_i
-        is_weights = in_support / np.maximum(beta, 1e-8)
+        y_min = float(np.min(rewards)) if len(rewards) > 0 else 0.0
+        y_max = float(np.max(rewards)) if len(rewards) > 0 else 1.0
+        y_range = max(y_max - y_min, 1e-4)
 
-        # 2. Choose CDF estimator
+        beta_scale = getattr(self.hparams, 'beta', 0.1)
+        if n_a == 0:
+            return y_min - beta_scale * y_range
+
+        rewards_a = rewards[mask]
+        beta_a = beta[mask]
+
+        # 2. Risk functional estimation
+        risk_measure = getattr(self.hparams, 'risk_measure', 'cvar')
+        alpha = getattr(self.hparams, 'alpha', 0.05)
+        lam = getattr(self.hparams, 'variance_lambda', 0.1)
+        theta = getattr(self.hparams, 'entropic_theta', 1.0)
         estimator = getattr(self.hparams, 'cdf_estimator', 'IS').upper()
 
         if estimator == 'WIS':
-            pseudo_r = _wis_cdf_estimate(rewards, is_weights, in_support, n)
+            w_a = 1.0 / np.maximum(beta_a, 1e-8)
+            rho_hat = _weighted_cvar(rewards_a, w_a, alpha) if risk_measure == 'cvar' else _apply_risk(rewards_a, risk_measure, alpha=alpha, lam=lam, theta=theta)
+            R = _compute_R_WIS(beta, in_support, n, K, delta=getattr(self.hparams, 'delta', 0.05), d_Pi=getattr(self.hparams, 'd_Pi', 1))
         elif estimator == 'DR':
-            # Simple model: mean reward for action a
-            mean_a = np.mean(rewards[actions == a]) if (actions == a).sum() > 0 else 0.0
-            model_pred = np.where(in_support, mean_a, mean_a)
-            pseudo_r = _dr_cdf_estimate(rewards, is_weights, in_support, model_pred)
+            mean_a = float(np.mean(rewards_a))
+            w_a = 1.0 / np.maximum(beta_a, 1e-8)
+            norm_w = w_a / (np.mean(w_a) + 1e-12)
+            dr_samples = mean_a + (rewards_a - mean_a) * np.clip(norm_w, 0.1, 10.0)
+            rho_hat = _cvar(dr_samples, alpha) if risk_measure == 'cvar' else _apply_risk(dr_samples, risk_measure, alpha=alpha, lam=lam, theta=theta)
+            R = _compute_R_WIS(beta, in_support, n, K, delta=getattr(self.hparams, 'delta', 0.05), d_Pi=getattr(self.hparams, 'd_Pi', 1))
         else:  # default: IS
-            pseudo_r = _is_cdf_estimate(rewards, is_weights, in_support, n)
+            w_a = 1.0 / np.maximum(beta_a, 1e-8)
+            rho_hat = _weighted_cvar(rewards_a, w_a, alpha) if risk_measure == 'cvar' else _apply_risk(rewards_a, risk_measure, alpha=alpha, lam=lam, theta=theta)
+            R = _compute_R_IS(beta, in_support, n, K, delta=getattr(self.hparams, 'delta', 0.05), d_Pi=getattr(self.hparams, 'd_Pi', 1))
 
-        # 3. Compute risk functional  rho_hat(pi_a)
-        risk_measure = getattr(self.hparams, 'risk_measure', 'cvar')
-        alpha   = getattr(self.hparams, 'alpha', 0.05)
-        lam     = getattr(self.hparams, 'variance_lambda', 0.1)
-        theta   = getattr(self.hparams, 'entropic_theta', 1.0)
-        rho_hat = _apply_risk(pseudo_r, risk_measure, alpha=alpha, lam=lam, theta=theta)
+        # 3. Lipschitz constant L = D / (1 - alpha)
+        L = _lipschitz_constant(risk_measure, alpha=alpha, lam=lam, y_max=y_range)
 
-        # 4. Confidence bound R(pi_a)  (Theorem 2 or 3)
-        delta = getattr(self.hparams, 'delta', 0.05)
-        d_Pi  = getattr(self.hparams, 'd_Pi', 1)
-
-        # beta_vals needed for sigma_pi are the propensities for the chosen action
-        beta_vals_a = beta  # beta(X_i, A_i=a) — approximated by action marginal
-        # For samples not in I_pi_a, beta_vals_a is irrelevant (sigma only over I_pi)
-
-        if estimator == 'WIS':
-            R = _compute_R_WIS(beta_vals_a, in_support, n, K, delta=delta, d_Pi=d_Pi)
-        else:
-            R = _compute_R_IS(beta_vals_a, in_support, n, K, delta=delta, d_Pi=d_Pi)
-
-        # 5. Lipschitz constant L
-        y_range = float(np.max(rewards) - np.min(rewards)) if len(rewards) > 0 else 1.0
-        L = _lipschitz_constant(risk_measure, alpha=alpha, lam=lam, y_max=max(y_range, 1.0))
-
-        # 6. LCB  (Eq def-pessimism)
-        beta_scale = getattr(self.hparams, 'beta', 1.0)   # tuning knob β
+        # 4. Pessimistic LCB
         lcb = rho_hat - beta_scale * L * R
-        return lcb
+        return float(lcb)
 
     # ------------------------------------------------------------------
     def sample_action(self, contexts: np.ndarray) -> np.ndarray:
         """
         Select action for each test context using the pessimistic policy:
             pi_tilde(x) = argmax_a LCB(a)
-
-        Since our current implementation uses a context-independent policy
-        (action statistics computed globally), the same action is returned
-        for all contexts.  This matches the paper's 'greedy' policy class.
-
-        For a context-aware version, wrap with a neural/linear model on top.
         """
         assert self._trained, "Call train_offline_batch() first."
         K = self._K
@@ -410,14 +429,11 @@ class PessimisticCDFContextualBandit(PessimisticCDFBandit):
     Context-aware extension: for each test context x, compute CDF estimate
     using kernel-weighted samples (soft version of I_pi local to x).
 
-    pi_tilde(x) = argmax_a  rho_hat_x(pi_a) - L * R_x(pi_a)
+    pi_tilde(x) = argmax_a  rho_hat_x(pi_a) - beta * L * R_x(pi_a)
 
     where the CDF estimate uses local importance weights:
         w_i(x) = K_h(X_i, x) * 1{A_i=a} / beta_hat_i
-
     K_h = Gaussian kernel with bandwidth h = hparams.rbf_sigma.
-
-    This recovers a fully context-aware policy without a parametric model.
     """
 
     def __init__(self, hparams, update_freq=1, name='PessimisticCDFContextual'):
@@ -425,13 +441,13 @@ class PessimisticCDFContextualBandit(PessimisticCDFBandit):
 
     def _gaussian_kernel(self, X_train: np.ndarray, x: np.ndarray,
                          sigma: float) -> np.ndarray:
-        """K_h(X_i, x) ∝ exp(-||X_i - x||^2 / (2*h^2)), normalized."""
+        """K_h(X_i, x) proportional to exp(-||X_i - x||^2 / (2*h^2)), normalized."""
         diffs = X_train - x[np.newaxis, :]          # (n, d)
         sq_dist = np.sum(diffs ** 2, axis=1)         # (n,)
-        log_w = -sq_dist / (2.0 * sigma ** 2)
+        log_w = -sq_dist / (2.0 * (sigma ** 2))
         log_w -= log_w.max()                         # numerical stability
         w = np.exp(log_w)
-        w /= w.sum() + 1e-12
+        w /= (w.sum() + 1e-12)
         return w  # (n,)
 
     def _compute_lcb_for_action_at_x(self, a: int, x: np.ndarray) -> float:
@@ -440,47 +456,59 @@ class PessimisticCDFContextualBandit(PessimisticCDFBandit):
         K = self._K
         sigma = getattr(self.hparams, 'rbf_sigma', 1.0)
 
-        # kernel weights k_i(x)
-        k_weights = self._gaussian_kernel(self._contexts, x, sigma)  # (n,)
-
         actions = self._actions
         rewards = self._rewards
         beta = self._beta_hat
 
-        # informative: A_i = a
-        in_support = (actions == a).astype(float)
+        mask = (actions == a)
+        n_a = int(mask.sum())
+        in_support = mask.astype(float)
+
+        y_min = float(np.min(rewards)) if len(rewards) > 0 else 0.0
+        y_max = float(np.max(rewards)) if len(rewards) > 0 else 1.0
+        y_range = max(y_max - y_min, 1e-4)
+
+        beta_scale = getattr(self.hparams, 'beta', 0.1)
+        if n_a == 0:
+            return y_min - beta_scale * y_range
+
+        # kernel weights for action a samples
+        k_weights = self._gaussian_kernel(self._contexts, x, sigma)
+        k_weights_a = k_weights[mask]
+        beta_a = beta[mask]
+        rewards_a = rewards[mask]
 
         # local IS weights: k_i * 1{A_i=a} / beta_i
-        is_weights = k_weights * in_support / np.maximum(beta, 1e-8)
-        is_weights_norm = is_weights / (is_weights[in_support.astype(bool)].sum() + 1e-12)
+        w_local = k_weights_a / np.maximum(beta_a, 1e-8)
 
-        # effective sample count
-        n_eff = max(1, int(in_support.sum()))
-
-        # CDF estimator on kernel-reweighted samples
-        estimator = getattr(self.hparams, 'cdf_estimator', 'IS').upper()
-        if estimator == 'WIS':
-            pseudo_r = _wis_cdf_estimate(rewards, is_weights_norm * n, in_support, n)
-        else:
-            pseudo_r = _is_cdf_estimate(rewards, is_weights_norm * n, in_support, n)
-
-        # risk
         risk_measure = getattr(self.hparams, 'risk_measure', 'cvar')
-        alpha   = getattr(self.hparams, 'alpha', 0.05)
-        lam     = getattr(self.hparams, 'variance_lambda', 0.1)
-        theta   = getattr(self.hparams, 'entropic_theta', 1.0)
-        rho_hat = _apply_risk(pseudo_r, risk_measure, alpha=alpha, lam=lam, theta=theta)
+        alpha = getattr(self.hparams, 'alpha', 0.05)
+        lam = getattr(self.hparams, 'variance_lambda', 0.1)
+        theta = getattr(self.hparams, 'entropic_theta', 1.0)
+        estimator = getattr(self.hparams, 'cdf_estimator', 'IS').upper()
 
-        # confidence bound — use effective n for local estimation
+        if risk_measure == 'cvar':
+            if estimator == 'DR':
+                mean_local = float(np.sum(rewards_a * w_local) / (np.sum(w_local) + 1e-12))
+                norm_w = w_local / (np.mean(w_local) + 1e-12)
+                dr_local = mean_local + (rewards_a - mean_local) * np.clip(norm_w, 0.1, 10.0)
+                rho_hat = _cvar(dr_local, alpha)
+            else:
+                rho_hat = _weighted_cvar(rewards_a, w_local, alpha)
+        else:
+            rho_hat = _apply_risk(rewards_a, risk_measure, alpha=alpha, lam=lam, theta=theta)
+
+        # confidence bound
         delta = getattr(self.hparams, 'delta', 0.05)
-        d_Pi  = getattr(self.hparams, 'd_Pi', 1)
-        R = _compute_R_IS(beta, in_support, n_eff, K, delta=delta, d_Pi=d_Pi)
+        d_Pi = getattr(self.hparams, 'd_Pi', 1)
+        if estimator == 'WIS':
+            R = _compute_R_WIS(beta, in_support, n, K, delta=delta, d_Pi=d_Pi)
+        else:
+            R = _compute_R_IS(beta, in_support, n, K, delta=delta, d_Pi=d_Pi)
 
-        y_range = float(np.max(rewards) - np.min(rewards)) + 1e-8
         L = _lipschitz_constant(risk_measure, alpha=alpha, lam=lam, y_max=y_range)
-        beta_scale = getattr(self.hparams, 'beta', 1.0)
-
-        return rho_hat - beta_scale * L * R
+        lcb = rho_hat - beta_scale * L * R
+        return float(lcb)
 
     def sample_action(self, contexts: np.ndarray) -> np.ndarray:
         assert self._trained, "Call train_offline_batch() first."

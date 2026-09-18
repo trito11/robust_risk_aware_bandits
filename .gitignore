@@ -22,6 +22,7 @@ main.py
 *.ipynb
 !plot_synthetic.ipynb 
 !plot_convergence.ipynb
+!plot_simglucose.ipynb
 !plot_realworld.ipynb
 dev_main.py
 !/data/meta/
@@ -29,3 +30,7 @@ dev_main.py
 !/data/*.py
 wandb/
 out.log
+*:Zone.Identifier
+scratch/
+New folder/
+

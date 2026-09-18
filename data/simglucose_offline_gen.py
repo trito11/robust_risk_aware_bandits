@@ -202,6 +202,7 @@ def collect_simglucose_data(n_train=2000, n_test=200, n_oracle_trials=10, save_p
 
     train_contexts, train_actions, train_rewards = [], [], []
     test_contexts, test_mean_matrix, test_cvar_matrix = [], [], []
+    test_trials_matrix = []
 
     # Resume from existing file if available
     if os.path.exists(save_path):
@@ -213,6 +214,8 @@ def collect_simglucose_data(n_train=2000, n_test=200, n_oracle_trials=10, save_p
                 test_contexts = list(data['test_contexts'])
                 test_mean_matrix = list(data['test_mean'])
                 test_cvar_matrix = list(data['test_cvar'])
+                if 'test_trials' in data:
+                    test_trials_matrix = list(data['test_trials'])
             print(f" [RESUME] Loaded {len(train_contexts) + len(test_contexts)} existing samples from {save_path}")
         except Exception as e:
             print(f" [WARNING] Could not resume from {save_path}: {e}")
@@ -342,15 +345,16 @@ def collect_simglucose_data(n_train=2000, n_test=200, n_oracle_trials=10, save_p
                             res = queue.get() if not queue.empty() else ("TIMEOUT", None)
                             if res[0] == "SUCCESS":
                                 all_rewards = res[1]
-                                action_means, action_cvars = [], []
+                                action_means, action_cvars, action_trials = [], [], []
                                 # Build per-unique-action stats
-                                unique_means, unique_cvars = [], []
+                                unique_means, unique_cvars, unique_trials = [], [], []
                                 n_tail = max(1, int(alpha * n_oracle_trials))
                                 for a_idx in range(n_unique_actions):
                                     trial_rewards = all_rewards[a_idx * n_oracle_trials : (a_idx + 1) * n_oracle_trials]
                                     unique_means.append(float(np.mean(trial_rewards)))
                                     sorted_rew = np.sort(trial_rewards)
                                     unique_cvars.append(float(np.mean(sorted_rew[:n_tail])))
+                                    unique_trials.append(trial_rewards)
 
                                 # Replicate capped-action stats for arms beyond the physical limit
                                 # so the output matrix is always (N_test, 11).
@@ -358,10 +362,12 @@ def collect_simglucose_data(n_train=2000, n_test=200, n_oracle_trials=10, save_p
                                     capped = min(a, max_bolus_oracle)
                                     action_means.append(unique_means[capped])
                                     action_cvars.append(unique_cvars[capped])
+                                    action_trials.append(unique_trials[capped])
 
                                 test_contexts.append(ctx)
                                 test_mean_matrix.append(action_means)
                                 test_cvar_matrix.append(action_cvars)
+                                test_trials_matrix.append(action_trials)
                                 patient_count += 1
                                 pbar.update(1)
                             else:
@@ -373,24 +379,32 @@ def collect_simglucose_data(n_train=2000, n_test=200, n_oracle_trials=10, save_p
 
                 # Save every time new data is added
                 tqdm.write(f" [SAVE] Saving {len(train_contexts) + len(test_contexts)} samples to {save_path}...")
-                np.savez(save_path, 
-                         train_contexts=np.array(train_contexts), 
-                         train_actions=np.array(train_actions), 
-                         train_rewards=np.array(train_rewards), 
-                         test_contexts=np.array(test_contexts), 
-                         test_mean=np.array(test_mean_matrix),
-                         test_cvar=np.array(test_cvar_matrix))
+                save_payload = {
+                    'train_contexts': np.array(train_contexts),
+                    'train_actions': np.array(train_actions),
+                    'train_rewards': np.array(train_rewards),
+                    'test_contexts': np.array(test_contexts),
+                    'test_mean': np.array(test_mean_matrix),
+                    'test_cvar': np.array(test_cvar_matrix),
+                }
+                if test_trials_matrix:
+                    save_payload['test_trials'] = np.array(test_trials_matrix)
+                np.savez(save_path, **save_payload)
 
             advance_master_env()
         pbar.close()
 
-    np.savez(save_path, 
-             train_contexts=np.array(train_contexts), 
-             train_actions=np.array(train_actions), 
-             train_rewards=np.array(train_rewards), 
-             test_contexts=np.array(test_contexts), 
-             test_mean=np.array(test_mean_matrix),
-             test_cvar=np.array(test_cvar_matrix))
+    save_payload = {
+        'train_contexts': np.array(train_contexts),
+        'train_actions': np.array(train_actions),
+        'train_rewards': np.array(train_rewards),
+        'test_contexts': np.array(test_contexts),
+        'test_mean': np.array(test_mean_matrix),
+        'test_cvar': np.array(test_cvar_matrix),
+    }
+    if test_trials_matrix:
+        save_payload['test_trials'] = np.array(test_trials_matrix)
+    np.savez(save_path, **save_payload)
     print(f"\nSuccess! Total samples: {len(train_contexts) + len(test_contexts)}")
     print(f"Saved to: {save_path}")
 
