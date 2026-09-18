@@ -13,19 +13,15 @@ class SimglucoseData:
         data = np.load(path)
         self.alpha = float(alpha)
         
-        # Load and potentially slice training data
-        all_train_ctx = data['train_contexts'].astype(np.float32)
-        all_train_act = data['train_actions'].astype(np.int32)
-        all_train_rew = data['train_rewards'].astype(np.float32)
+        # Store full training dataset pool
+        self.all_train_contexts = data['train_contexts'].astype(np.float32)
+        self.all_train_actions = data['train_actions'].astype(np.int32)
+        self.all_train_rewards = data['train_rewards'].astype(np.float32)
 
-        if num_contexts is not None and num_contexts < len(all_train_ctx):
-            self.train_contexts = all_train_ctx[:num_contexts]
-            self.train_actions = all_train_act[:num_contexts]
-            self.train_rewards = all_train_rew[:num_contexts]
-        else:
-            self.train_contexts = all_train_ctx
-            self.train_actions = all_train_act
-            self.train_rewards = all_train_rew
+        self.num_contexts = int(num_contexts) if num_contexts is not None else len(self.all_train_contexts)
+        self.train_contexts = self.all_train_contexts[:self.num_contexts]
+        self.train_actions = self.all_train_actions[:self.num_contexts]
+        self.train_rewards = self.all_train_rewards[:self.num_contexts]
         
         self.test_contexts = data['test_contexts'].astype(np.float32)
         
@@ -71,17 +67,20 @@ class SimglucoseData:
         
     def reset_data(self, sim_id=0):
         """
-        Returns the data for the current simulation with optional shuffling.
+        Returns a random i.i.d. subset of num_contexts from the full dataset pool for simulation sim_id.
         """
         np.random.seed(sim_id)
+        total_samples = len(self.all_train_contexts)
+        perm = np.random.permutation(total_samples)
         
-        # Shuffle training data to get different samples for each simulation
-        indices = np.arange(len(self.train_contexts))
-        np.random.shuffle(indices)
+        if self.num_contexts < total_samples:
+            selected_indices = perm[:self.num_contexts]
+        else:
+            selected_indices = perm
         
-        shuffled_train_ctx = self.train_contexts[indices]
-        shuffled_train_act = self.train_actions[indices]
-        shuffled_train_rew = self.train_rewards[indices]
+        shuffled_train_ctx = self.all_train_contexts[selected_indices]
+        shuffled_train_act = self.all_train_actions[selected_indices]
+        shuffled_train_rew = self.all_train_rewards[selected_indices]
         
         return (shuffled_train_ctx, 
                 shuffled_train_act, 
